@@ -201,6 +201,7 @@ Copyright 2024 The Hugging Face team. All rights reserved.
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+<<<<<<< HEAD
 
 
 ## Some of lerobot's code is derived from Diffusion Policy, which is subject to the following copyright notice:
@@ -505,3 +506,5 @@ SOFTWARE.
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+=======
+>>>>>>> origin/main
