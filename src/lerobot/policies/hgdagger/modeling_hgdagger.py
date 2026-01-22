@@ -35,7 +35,6 @@ from lerobot.policies.utils import get_device_from_parameters
 from lerobot.policies.sac.modeling_sac import SACObservationEncoder, CriticHead, CriticEnsemble, DiscreteCritic, MLP
 from lerobot.policies.awac.modeling_awac import Policy as TanhPolicy
 from lerobot.policies.hgdagger.configuration_hgdagger import HGDaggerConfig
-DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 
 
 class HGDaggerPolicy(
@@ -57,15 +56,11 @@ class HGDaggerPolicy(
 
         # Determine action dimension and initialize all components
         continuous_action_dim = config.output_features["action"].shape[0]
-        
+        self.continuous_action_dim = continuous_action_dim
+
         self._init_normalization(dataset_stats)
         # 初始化观测编码器（Actor与Critic可共享或独立）
         self._init_encoders()  
-        # 初始化Critic网络（连续动作+可选离散动作）
-        # self._init_critics(continuous_action_dim)
-        # # 初始化Critic网络（连续动作+可选离散动作）
-        # self._init_prob_networks()
-        # 初始化Actor网络（输出连续动作分布）
         self._init_actor(continuous_action_dim)
 
     def get_optim_params(self) -> dict:
@@ -77,29 +72,13 @@ class HGDaggerPolicy(
                 # 若共享编码器，Actor不优化编码器参数（避免梯度冲突）
                 if not n.startswith("encoder") or not self.shared_encoder
             ],
-            #  "critic": self.critic_ensemble.parameters(),
-            #  "prob": self.prob_ensemble.parameters(),
         }
-        # 若有离散动作，添加离散Critic参数
-        # if self.config.num_discrete_actions is not None:
-        #     optim_params["discrete_critic"] = self.discrete_critic.parameters()
-            # todo9:优化discrete_actor参数
-            # optim_params["discrete_actor"] = self.discrete_actor.parameters()
         return optim_params
 
     def reset(self):
         """Reset the policy"""
         pass
     
-
-    # @torch.no_grad()
-    # def get_prob(self, observation: dict[str, Tensor], future=False) -> float:
-    #     """Get the probability of the action"""
-    #     observations_features = None
-    #     if self.shared_encoder and self.actor.encoder.has_images:
-    #         observations_features = self.actor.encoder.get_cached_image_features(observation, normalize=True)
-    #     probs = self.prob_ensemble(observation, observation_features=observations_features)
-    #     return probs.squeeze(-1).item()
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -183,7 +162,7 @@ class HGDaggerPolicy(
     def forward(
         self,
         batch: dict[str, Tensor | dict[str, Tensor]],
-        model: Literal["actor", "critic", "temperature", "discrete_critic", "discrete_actor"] = "critic",
+        model: Literal["actor"] = "actor",
     ) -> dict[str, Tensor]:
         """Compute the loss for the given model
 
@@ -207,49 +186,6 @@ class HGDaggerPolicy(
         observation_features: Tensor = batch.get("observation_feature")
         # weights: Tensor = batch["weights"]
 
-        if model == "critic":
-            # Extract critic-specific components
-            rewards: Tensor = batch["reward"]
-            next_observations: dict[str, Tensor] = batch["next_state"]
-            done: Tensor = batch["done"]
-            next_observation_features: Tensor = batch.get("next_observation_feature")
-
-
-            loss_critic = self.compute_loss_critic(
-                observations=observations,
-                actions=actions,
-                rewards=rewards,
-                next_observations=next_observations,
-                done=done,
-                observation_features=observation_features,
-                next_observation_features=next_observation_features,
-            )
-
-            return {
-                "loss_critic": loss_critic,
-            }
-
-
-        if model == "discrete_critic" and self.config.num_discrete_actions is not None:
-            # Extract critic-specific components
-            rewards: Tensor = batch["reward"]
-            next_observations: dict[str, Tensor] = batch["next_state"]
-            done: Tensor = batch["done"]
-            is_intervention: Tensor = batch["is_intervention"]
-            next_observation_features: Tensor = batch.get("next_observation_feature")
-            complementary_info = batch.get("complementary_info")
-            loss_discrete_critic_dict = self.compute_loss_discrete_critic(
-                observations=observations,
-                actions=actions,
-                rewards=rewards,
-                next_observations=next_observations,
-                done=done,
-                is_intervention=is_intervention,
-                observation_features=observation_features,
-                next_observation_features=next_observation_features,
-                complementary_info=complementary_info,
-            )
-            return loss_discrete_critic_dict
         if model == "actor":
             is_intervention = batch.get("is_intervention")
             loss_actor_dict = self.compute_loss_actor(
@@ -275,198 +211,6 @@ class HGDaggerPolicy(
     def update_target_networks(self):
         pass
 
-        # """Update target networks with exponential moving average"""
-        # # for target_param, param in zip(
-        # #     self.critic_target.parameters(),
-        # #     self.critic_ensemble.parameters(),
-        # # ):
-        #     # target_param.data.copy_(
-        #     #     param.data * self.config.critic_target_update_weight
-        #     #     + target_param.data * (1.0 - self.config.critic_target_update_weight)
-        #     # )
-
-        # if self.config.num_discrete_actions is not None:
-        #     for target_param, param in zip(
-        #         self.discrete_critic_target.parameters(),  # 离散目标Critic参数
-        #         self.discrete_critic.parameters(),  # 当前离散Critic参数
-        #     ):
-        #         target_param.data.copy_(
-        #             # 指数移动平均公式：新目标参数 = 当前参数×α + 旧目标参数×(1-α)
-        #             param.data * self.config.critic_target_update_weight
-        #             + target_param.data * (1.0 - self.config.critic_target_update_weight)
-        #         )
-
-        # for target_param, param in zip(
-        #     self.actor_target.parameters(),
-        #     self.actor_ensemble.parameters(),
-        # ):
-        #     target_param.data.copy_(
-        #         param.data * self.config.actor_target_update_weight
-        #         + target_param.data * (1.0 - self.config.actor_target_update_weight)
-        #     )
-
-        
-    
-    def compute_loss_prob(self,
-        target_prob,
-        observations,
-        observation_features: Tensor | None = None,
-    ) -> Tensor:
-        # Get predicted Q-values for current observations
-        probs = self.prob_ensemble(observations, observation_features=observation_features)
-        probs = probs.squeeze(-1)
-        prob_loss = F.mse_loss(
-                input=probs,
-                target=target_prob,
-                reduction="none",
-            )
-        prob_loss = prob_loss.mean()
-        return prob_loss
-
-    def compute_loss_critic(
-        self,
-        observations,
-        actions,
-        rewards,
-        next_observations,
-        done,
-        observation_features: Tensor | None = None,
-        next_observation_features: Tensor | None = None,
-    ) -> Tensor:
-        with torch.no_grad():
-            
-            # next_action_preds = self.actor(next_observations, next_observation_features)
-            next_action_preds = self.actor_target(next_observations, next_observation_features)
-            noise = (
-				torch.randn_like(next_action_preds) * self.config.policy_noise
-			).clamp(-self.config.noise_clip, self.config.noise_clip)
-            next_action_preds = next_action_preds + noise
-			
-            # 目标Critic计算 “下一状态-动作对” 的 Q 值
-            q_targets = self.critic_forward(
-                observations=next_observations,
-                actions=next_action_preds,
-                use_target=True,
-                observation_features=next_observation_features,
-            )
-
-            # subsample critics to prevent overfitting if use high UTD (update to date)
-            # TODO: Get indices before forward pass to avoid unnecessary computation
-            if self.config.num_subsample_critics is not None:
-                indices = torch.randperm(self.config.num_critics)
-                indices = indices[: self.config.num_subsample_critics]
-                q_targets = q_targets[indices]
-
-            # critics subsample size
-            min_q, _ = q_targets.min(dim=0)  # Get values from min operation
-            # 计算最终目标Q值（TD Target）：r + γ*(1-done)*min_q
-            td_target = rewards + (1 - done) * self.config.discount * min_q
-
-        # 当前Critic预测 “当前状态 - 动作对” 的 Q 值
-        if self.config.num_discrete_actions is not None:
-            # NOTE: We only want to keep the continuous action part
-            # In the buffer we have the full action space (continuous + discrete)
-            # We need to split them before concatenating them in the critic forward
-            actions: Tensor = actions[:, :DISCRETE_DIMENSION_INDEX]
-        q_preds = self.critic_forward(
-            observations=observations,
-            actions=actions,
-            use_target=False,
-            observation_features=observation_features,
-        )
-
-        # 4- Calculate loss
-        # Compute state-action value loss (TD loss) for all of the Q functions in the ensemble.
-        td_target_duplicate = einops.repeat(td_target, "b -> e b", e=q_preds.shape[0])
-        # You compute the mean loss of the batch for each critic and then to compute the final loss you sum them up
-        critics_loss = (
-            F.mse_loss(
-                input=q_preds,
-                target=td_target_duplicate,
-                reduction="none",
-            ).mean(dim=1)
-        ).sum()
-
-        return critics_loss
-    
-    def compute_loss_discrete_critic(
-        self,
-        observations,
-        actions,
-        rewards,
-        next_observations,
-        done,
-        is_intervention,
-        observation_features=None,
-        next_observation_features=None,
-        complementary_info=None,
-    ):
-        # NOTE: We only want to keep the discrete action part
-        # In the buffer we have the full action space (continuous + discrete)
-        # We need to split them before concatenating them in the critic forward
-        # ============= todo: add bc loss to discrete critic =============
-        actions_discrete: Tensor = actions[:, DISCRETE_DIMENSION_INDEX:].clone()
-        actions_discrete = torch.round(actions_discrete)
-        actions_discrete = actions_discrete.long()
-
-        discrete_penalties: Tensor | None = None
-
-        if complementary_info is not None:
-            discrete_penalties: Tensor | None = complementary_info.get("discrete_penalty")
-        with torch.no_grad():
-            # For DQN, select actions using online network, evaluate with target network
-            next_discrete_qs = self.discrete_critic_forward(
-                next_observations, use_target=False, observation_features=next_observation_features
-            )
-
-            best_next_discrete_action = torch.argmax(next_discrete_qs, dim=-1, keepdim=True)
-    
-
-            # Get target Q-values from target network
-            target_next_discrete_qs = self.discrete_critic_forward(
-                observations=next_observations,
-                use_target=True,
-                observation_features=next_observation_features,
-            )
-
-
-            # Use gather to select Q-values for best actions
-            target_next_discrete_q = torch.gather(
-                target_next_discrete_qs, dim=1, index=best_next_discrete_action
-            ).squeeze(-1)
-
-
-            # Compute target Q-value with Bellman equation
-            rewards_discrete = rewards
-
-            if discrete_penalties is not None:
-                rewards_discrete = rewards + discrete_penalties
-            
-
-            target_discrete_q = rewards_discrete + (1 - done) * self.config.discount * target_next_discrete_q
-
-        # Get predicted Q-values for current observations
-        predicted_discrete_qs = self.discrete_critic_forward(
-            observations=observations, use_target=False, observation_features=observation_features
-        )
-
-
-        # Use gather to select Q-values for taken actions
-        predicted_discrete_q = torch.gather(predicted_discrete_qs, dim=1, index=actions_discrete).squeeze(-1)
-
-        # Compute MSE loss between predicted and target Q-values
-    
-        discrete_critic_loss = F.mse_loss(input=predicted_discrete_q, target=target_discrete_q)
-
-        expert_q_preds = predicted_discrete_q
-        bc_loss = - expert_q_preds * is_intervention
-        bc_loss = bc_loss.mean()      
-        discrete_critic_loss_total = discrete_critic_loss + bc_loss
-        return {
-            "loss_discrete_critic": discrete_critic_loss_total,
-            "loss_bc": bc_loss,
-            "loss_q": discrete_critic_loss,
-        }
 
 
     # todo1:compute_loss_discrete_actor nll
@@ -482,7 +226,7 @@ class HGDaggerPolicy(
         # We need to split them before concatenating them in the critic forward
         # ============= todo: add bc loss to discrete critic =============
         # 提取真实的离散动作部分并转换为整数标签
-        actions_discrete: Tensor = old_actions[:, DISCRETE_DIMENSION_INDEX:].clone()
+        actions_discrete: Tensor = old_actions[:, self.continuous_action_dim:].clone()
         # 四舍五入为整数离散值
         actions_discrete = torch.round(actions_discrete)
         actions_discrete = actions_discrete.long()
@@ -510,30 +254,16 @@ class HGDaggerPolicy(
         is_intervention: Tensor | None = None,
         old_actions: Tensor | None = None,
     ) -> Tensor:
-        
-        # actions_pi = self.actor(observations, observation_features)
-        # bc_loss = F.mse_loss(actions_pi, old_actions[:, 0:6], reduction="none").sum(dim=-1)
-        
-        log_probs = self.actor.get_log_probs(observations, old_actions[:, 0:6], observation_features)
-        # print('log_probs:', log_probs)
+
+        log_probs = self.actor.get_log_probs(observations, old_actions[:, 0:self.continuous_action_dim], observation_features)
         bc_loss = - log_probs
 
         bc_loss = bc_loss.mean()
 
-        _, _, expert_std = self.actor.get_dist(observations, observation_features)
-        allow_distance = expert_std.sum(dim=-1)
-
-
-     
-
-        # ============ todo: add to_goal_probs to min_q_preds ============
-        # actor_loss = - min_q_preds + bc_loss
         actor_loss = bc_loss
         return {
             "loss_actor": actor_loss,
             "bc_loss": bc_loss,
-            "min_q_preds": actor_loss.clone().detach(),
-            "allow_d": allow_distance.mean().item()
         }
     
 
@@ -591,17 +321,7 @@ class HGDaggerPolicy(
 
         if self.config.num_discrete_actions is not None:
             self._init_discrete_critics()
-            # self._init_discrete_actor()
-    
-    def _init_prob_networks(self, ):
-        """Build critic ensemble, targets, and optional discrete critic."""
-        heads = CriticHead(
-                input_dim=self.encoder_critic.output_dim,
-                **asdict(self.config.critic_network_kwargs),
-            )
-        self.prob_ensemble = ValueEnsemble(
-            encoder=self.encoder_critic, ensemble=heads, output_normalization=nn.Sigmoid()
-        )
+
 
     # todo3:初始化discrete_actor
     def _init_discrete_actor(self):
@@ -639,44 +359,11 @@ class HGDaggerPolicy(
             network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
             action_dim=continuous_action_dim,
             encoder_is_shared=self.shared_encoder,
-            # fixed_std=torch.tensor([5e-3]).to("cuda:0"),
             **asdict(self.config.policy_kwargs),
         )
         if self.config.num_discrete_actions is not None:
             self._init_discrete_actor()
-        
-        # self.actor_target = Policy(
-        #     encoder=self.encoder_actor,
-        #     network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
-        #     action_dim=continuous_action_dim,
-        #     encoder_is_shared=self.shared_encoder,
-        #     **asdict(self.config.policy_kwargs),
-        # )
-        # self.actor_target.load_state_dict(self.actor.state_dict())
 
-        # # ensemble
-        # policy_ensemble = [
-        #     Policy(
-        #         encoder=self.encoder_actor, 
-        #         network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
-        #         action_dim=continuous_action_dim, 
-        #         encoder_is_shared=self.shared_encoder, 
-        #         **asdict(self.config.policy_kwargs), 
-        #     )
-        #     for _ in range(self.config.num_actors)
-        # ]
-        # self.actor = ActorEnsemble(
-        #     encoder=self.encoder_actor, 
-        #     ensemble=policy_ensemble
-        # )
-
-        # 目标熵
-        # self.target_entropy = self.config.target_entropy
-        # if self.target_entropy is None:
-        #     dim = continuous_action_dim + (1 if self.config.num_discrete_actions is not None else 0)
-        #     self.target_entropy = -np.prod(dim) / 2
-
-        
 
 class Policy(nn.Module):
     def __init__(
@@ -1010,115 +697,3 @@ class MultivariateNormalDiag(MultivariateNormal):
         # Use parent class entropy method
         return super().entropy()
 
-
-
-
-class ValueEnsemble(nn.Module):
-    """
-    ValueEnsemble wraps multiple CriticHead modules into an ensemble.
-
-    Args:
-        encoder (SACObservationEncoder): encoder for observations.
-        ensemble (List[CriticHead]): list of critic heads.
-        output_normalization (nn.Module): normalization layer for actions.
-        init_final (float | None): optional initializer scale for final layers.
-
-    Forward returns a tensor of shape (num_critics, batch_size) containing V-values.
-    """
-
-    def __init__(
-        self,
-        encoder: SACObservationEncoder,
-        ensemble: CriticHead,
-        output_normalization: nn.Module,
-        init_final: float | None = None,
-    ):
-        super().__init__()
-        self.encoder = encoder
-        self.init_final = init_final
-        self.output_normalization = output_normalization
-        self.critics = ensemble
-
-
-    def forward(
-        self,
-        observations: dict[str, torch.Tensor],
-        observation_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        device = get_device_from_parameters(self)
-        # Move each tensor in observations to device
-        observations = {k: v.to(device) for k, v in observations.items()}
-
-        obs_enc = self.encoder(observations, cache=observation_features)
-
-        inputs = obs_enc
-
-        q_values = self.critics(inputs)
-        # Loop through critics and collect outputs
-        # q_values = []
-        # for critic in self.critics:
-        #     q_values.append(critic(inputs))
-
-        # # Stack outputs to match expected shape [num_critics, batch_size]
-        # q_values = torch.stack([q.squeeze(-1) for q in q_values], dim=0)
-        q_values = self.output_normalization(q_values)
-        return q_values
-
-
-# class ActorEnsemble(nn.Module):
-#     """
-#     ActorEnsemble wraps multiple ActorHead modules into an ensemble.
-
-#     Args:
-#         encoder (SACObservationEncoder): encoder for observations.
-#         ensemble (List[ActorHead]): list of critic heads.
-#         output_normalization (nn.Module): normalization layer for actions.
-#         init_final (float | None): optional initializer scale for final layers.
-
-#     Forward returns a tensor of shape (num_critics, batch_size) containing Q-values.
-#     """
-
-#     def __init__(
-#         self,
-#         encoder: SACObservationEncoder,
-#         ensemble: list[Policy],
-#         init_final: float | None = None,
-#     ):
-#         super().__init__()
-#         self.encoder = encoder
-#         self.init_final = init_final
-#         self.policies = nn.ModuleList(ensemble)
-
-#     def forward(
-#         self,
-#         observations: dict[str, torch.Tensor],
-#         observation_features: torch.Tensor | None = None,
-#     ) -> torch.Tensor:
-#         """
-#         前向传播：输入观测，输出所有策略头的动作。
-        
-#         Args:
-#             observations: 原始观测字典（如图像、传感器数据）。
-#             observation_features: 预计算的观测特征（可选，用于复用特征）。
-        
-#         Returns:
-#             所有策略头的动作，形状为 (num_actors, batch_size, action_dim)
-#         """
-#         device = get_device_from_parameters(self)
-#         # Move each tensor in observations to device
-#         observations = {k: v.to(device) for k, v in observations.items()}
-
-#         # 每个策略头独立计算动作
-#         actions = []
-#         for policy in self.policies:
-#             action = policy(observations, observation_features) # action 形状 (batch_size, action_dim)
-#             actions.append(action)
-
-#         # 堆叠所有策略的动作，形状为 (num_actors, batch_size, action_dim)
-#         actions = torch.stack(actions, dim=0)
-#         # print("before mean actions.shape:", actions.shape)
-#         actions = torch.mean(actions, dim=0)
-#         # print("after mean actions.shape:", actions.shape)
-#         return actions
-
-        
