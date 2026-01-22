@@ -35,7 +35,6 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters
 from lerobot.policies.sac.modeling_sac import SACObservationEncoder, CriticHead, CriticEnsemble, DiscreteCritic, MLP
 from lerobot.policies.silri.configuration_silri import SiLRIConfig
-DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 
 
 class SiLRIPolicy(
@@ -386,7 +385,7 @@ class SiLRIPolicy(
         is_intervention: Tensor | None = None,
         old_actions: Tensor | None = None
     ):
-        actions_discrete: Tensor = old_actions[:, DISCRETE_DIMENSION_INDEX:].clone()
+        actions_discrete: Tensor = old_actions[:, self.continuous_action_dim:].clone()
         actions_discrete = torch.round(actions_discrete)
         actions_discrete = actions_discrete.long()
         actions_discrete = actions_discrete.squeeze(-1)

@@ -56,7 +56,7 @@ class SACPolicy(
 
         # Determine action dimension and initialize all components
         continuous_action_dim = config.output_features["action"].shape[0]
-        
+        self.continuous_action_dim = continuous_action_dim
         self._init_normalization(dataset_stats)
         # 初始化观测编码器（Actor与Critic可共享或独立）
         self._init_encoders()  
