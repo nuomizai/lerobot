@@ -543,16 +543,9 @@ class ReplayBuffer:
                 elif isinstance(v, torch.Tensor):
                     data[k] = v.to(storage_device)
 
-            action = data["action"]
-            """
-                offline action 边缘裁剪
-            """
-            epsilon = 1e-6
-            action[:6] = torch.clamp(action[:6], -1+epsilon, 1-epsilon)
-
             replay_buffer.add(
                 state=data["state"],
-                action=action,
+                action=data["action"],
                 reward=data["reward"],
                 next_state=data["next_state"],
                 done=data["done"],
