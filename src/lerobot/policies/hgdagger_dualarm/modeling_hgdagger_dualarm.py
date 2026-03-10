@@ -29,23 +29,22 @@ from torch import Tensor
 from torch.distributions import MultivariateNormal, TanhTransform, Transform, TransformedDistribution
 import os
 import cv2
-import copy
 from lerobot.policies.normalize import NormalizeBuffer
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters
-from lerobot.policies.sac.modeling_sac import SACObservationEncoder, CriticHead, CriticEnsemble, DiscreteCritic, MLP
-from lerobot.policies.silri.configuration_silri import SiLRIConfig
+from lerobot.policies.sac.modeling_sac import SACObservationEncoder, MLP, DiscreteCriticDualArm
+from lerobot.policies.hgdagger_dualarm.configuration_hgdagger_dualarm import HGDaggerDualArmConfig
 
 
-class SiLRIPolicy(
+class HGDaggerDualArmPolicy(
     PreTrainedPolicy,
 ):
-    config_class = SiLRIConfig
-    name = "silri"
+    config_class = HGDaggerDualArmConfig
+    name = "hgdagger_dualarm"
 
     def __init__(
         self,
-        config: SiLRIConfig | None = None,
+        config: HGDaggerDualArmConfig | None = None,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
         super().__init__(config)
@@ -55,20 +54,13 @@ class SiLRIPolicy(
         dataset_stats=self.config.dataset_stats
 
         # Determine action dimension and initialize all components
-        continuous_action_dim = config.output_features["action"].shape[0]
-        self.continuous_action_dim = continuous_action_dim
+        self.continuous_action_dim = config.output_features["action"].shape[0]
         
         self._init_normalization(dataset_stats)
         # 初始化观测编码器（Actor与Critic可共享或独立）
         self._init_encoders()  
-        # 初始化Critic网络（连续动作+可选离散动作）
-        self._init_critics(continuous_action_dim)
-
-        self._init_expert_network(continuous_action_dim)
-        self._init_lagrange_network()
-
         # 初始化Actor网络（输出连续动作分布）
-        self._init_actor(continuous_action_dim)
+        self._init_actor(self.continuous_action_dim)
 
     def get_optim_params(self) -> dict:
         """获取各模块的可优化参数，用于构建优化器"""
@@ -79,9 +71,6 @@ class SiLRIPolicy(
                 # 若共享编码器，Actor不优化编码器参数（避免梯度冲突）
                 if not n.startswith("encoder") or not self.shared_encoder
             ],
-            "critic": self.critic_ensemble.parameters(),
-            "expert": self.expert_network.parameters(),
-            "lagrange": self.lagrange_net.parameters(),
         }
         return optim_params
 
@@ -96,14 +85,14 @@ class SiLRIPolicy(
         raise NotImplementedError("SACPolicy does not support action chunking. It returns single actions!")
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], policy_noise=None) -> Tensor:
         """Select action for inference/evaluation"""
         """
-        Select action for inference/evaluation
+        推理/评估阶段选择动作
         Args:
-            batch: Dictionary of observations (containing images (right, wrist) and state)
+            batch: 观测字典（含图像（left、wrist）、状态）
         Returns:
-            Final action tensor (continuous action + optional discrete action concatenation)
+            最终动作张量（连续动作 + 可选离散动作拼接）
         """
         observations_features = None
         
@@ -115,15 +104,20 @@ class SiLRIPolicy(
         # actor网络生成当前观测对应的基础动作
         actions, *_ = self.actor(batch, observations_features)
 
+
         epsilon = 1e-6
         actions = torch.clamp(actions, -1+epsilon, 1-epsilon)
 
         # 若有离散动作，离散Critic输出各动作价值，选价值最大的动作
         # todo11
         if self.config.num_discrete_actions is not None:
+            # discrete_action_value = self.discrete_critic(batch, observations_features)
             discrete_action_value = self.discrete_actor(batch, observations_features)
             discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+            actions = actions.reshape(-1, 2, self.continuous_action_dim//2)
             actions = torch.cat([actions, discrete_action], dim=-1)
+            actions = actions.reshape(-1, self.continuous_action_dim+2)
+
         return actions, {}
 
     def critic_forward(
@@ -148,11 +142,27 @@ class SiLRIPolicy(
         q_values = critics(observations, actions, observation_features)
         return q_values
     
+    def discrete_critic_forward(
+        self, observations, use_target=False, observation_features=None
+    ) -> torch.Tensor:
+        """Forward pass through a discrete critic network
+
+        Args:
+            observations: Dictionary of observations
+            use_target: If True, use target critics, otherwise use ensemble critics
+            observation_features: Optional pre-computed observation features to avoid recomputing encoder output
+
+        Returns:
+            Tensor of Q-values from the discrete critic network
+        """
+        discrete_critic = self.discrete_critic_target if use_target else self.discrete_critic
+        q_values = discrete_critic(observations, observation_features)
+        return q_values
 
     def forward(
         self,
         batch: dict[str, Tensor | dict[str, Tensor]],
-        model: Literal["actor", "critic", "temperature", "discrete_critic", "discrete_actor", "expert", "lagrange", "actor_bc"] = "critic",
+        model: Literal["actor"] = "actor",
     ) -> dict[str, Tensor]:
         """Compute the loss for the given model
 
@@ -165,7 +175,7 @@ class SiLRIPolicy(
                 - done: Done mask tensor
                 - observation_feature: Optional pre-computed observation features
                 - next_observation_feature: Optional pre-computed next observation features
-            model: Which model to compute the loss for ("actor", "critic", "discrete_critic", or "temperature")
+            model: Which model to compute the loss for ("actor")
 
         Returns:
             The computed loss tensor
@@ -176,77 +186,16 @@ class SiLRIPolicy(
         observation_features: Tensor = batch.get("observation_feature")
         # weights: Tensor = batch["weights"]
 
-        if model == "critic":
-            # Extract critic-specific components
-            rewards: Tensor = batch["reward"]
-            next_observations: dict[str, Tensor] = batch["next_state"]
-            done: Tensor = batch["done"]
-            next_observation_features: Tensor = batch.get("next_observation_feature")
-
-
-            loss_critic = self.compute_loss_critic(
-                observations=observations,
-                actions=actions,
-                rewards=rewards,
-                next_observations=next_observations,
-                done=done,
-                observation_features=observation_features,
-                next_observation_features=next_observation_features,
-            )
-
-            return {
-                "loss_critic": loss_critic,
-            }
-        
-        if model == "expert":
-            is_intervention = batch.get("is_intervention")
-            loss_expert, allow_distance = self.compute_loss_expert(
-                observations=observations,
-                actions=actions,
-                observation_features=observation_features,
-                is_intervention=is_intervention,
-            )
-            return {"loss_expert": loss_expert, "allow_d": allow_distance}
-        
-        if model == "actor_bc":
-            is_intervention = batch.get("is_intervention")
-            loss_actor_dict = self.compute_loss_actor_bc(
-                observations=observations,
-                actions=actions,
-                observation_features=observation_features,
-                is_intervention=is_intervention,
-            )
-
-            if self.config.num_discrete_actions is not None:
-                loss_discrete_actor = self.compute_loss_discrete_actor(
-                    observations=observations,
-                    observation_features=observation_features,
-                    is_intervention=is_intervention,
-                    old_actions=actions,
-                )
-                loss_actor_dict["loss_actor_bc"] = loss_actor_dict["loss_actor_bc"] + loss_discrete_actor["loss_actor"]
-            return loss_actor_dict
-            
-        if model == "lagrange":
-            is_intervention = batch.get("is_intervention")
-            loss_lagrange, mean_d, allow_d, cost_dev = self.compute_loss_lagrange(
-                observations=observations,
-                observation_features=observation_features,
-            )
-            return {
-                "loss_lagrange": loss_lagrange,
-                "mean_d": mean_d,
-                "allow_d": allow_d, 
-                "cost_dev": cost_dev
-            }
-
         if model == "actor":
             is_intervention = batch.get("is_intervention")
             loss_actor_dict = self.compute_loss_actor(
                     observations=observations,
                     observation_features=observation_features,
+                    is_intervention=is_intervention,
+                    old_actions=actions,
                 )
 
+            loss_actor_dict["continous_actor_loss"] = loss_actor_dict["loss_actor"].item()
             if self.config.num_discrete_actions is not None:
                 loss_discrete_actor = self.compute_loss_discrete_actor(
                     observations=observations,
@@ -254,130 +203,21 @@ class SiLRIPolicy(
                     is_intervention=is_intervention,
                     old_actions=actions,
                 )
-                loss_actor_dict["loss_continuous_actor"] = loss_actor_dict["loss_actor"].item()
+                loss_actor_dict["discrete_actor_loss"] = loss_discrete_actor["loss_actor"].item()
                 loss_actor_dict["loss_actor"] = loss_actor_dict["loss_actor"] + loss_discrete_actor["loss_actor"]
-                loss_actor_dict["loss_discrete_actor"] = loss_discrete_actor["loss_actor"].item()
-            else:
-                loss_actor_dict["loss_actor"] = loss_actor_dict["loss_actor"]
             return loss_actor_dict
 
         raise ValueError(f"Unknown model type: {model}")
 
 
     def update_target_networks(self):
-
-        """Update target networks with exponential moving average"""
-        for target_param, param in zip(
-            self.critic_target.parameters(),
-            self.critic_ensemble.parameters(),
-        ):
-            target_param.data.copy_(
-                param.data * self.config.critic_target_update_weight
-                + target_param.data * (1.0 - self.config.critic_target_update_weight)
-            )
-
-        for target_param, param in zip(
-            self.actor_target.parameters(),
-            self.actor.parameters(),
-        ):
-            target_param.data.copy_(
-                param.data * self.config.actor_target_update_weight
-                + target_param.data * (1.0 - self.config.actor_target_update_weight)
-            )
-
-    def compute_loss_expert(self, observations, actions, observation_features: Tensor | None = None, is_intervention: Tensor | None = None) -> Tensor:
-        log_probs = self.expert_network.get_log_probs(observations, actions[:, 0:self.continuous_action_dim], observation_features)
-        
-        loss_expert = - log_probs * is_intervention
-        loss_expert = loss_expert.sum() / is_intervention.sum().item()
-
-        _, expert_means, expert_std = self.expert_network.get_dist(observations, observation_features)
-        allow_distance = expert_std.sum(dim=-1).mean().item()
-        return loss_expert, allow_distance  
-
-    def compute_loss_actor_bc(self, observations, actions, observation_features: Tensor | None = None, is_intervention: Tensor | None = None) -> Tensor:
-        log_probs = self.actor.get_log_probs(observations, actions[:, 0:self.continuous_action_dim], observation_features)
-        loss_actor_bc = - log_probs * is_intervention
-        loss_actor_bc = loss_actor_bc.sum() / is_intervention.sum().item()
-        return {
-            "loss_actor_bc":loss_actor_bc
-            }
+        pass
 
 
-    def compute_loss_lagrange(self, observations, observation_features: Tensor | None = None) -> Tensor:
-        with torch.no_grad():
-          
-            _, actions_expert, expert_std = self.expert_network.get_dist(observations, observation_features)
-            allow_distance = expert_std.sum(dim=-1)
-            _, _, actions_model = self.actor(observations, observation_features)
-            
-            mean_distance = (actions_expert - actions_model).pow(2).sum(-1).sqrt()
-            cost_dev = mean_distance - allow_distance
 
 
-            cost_dev = cost_dev - 0.2
 
-        lagrange_multiplier = self.lagrange_net(observations, observation_features=observation_features)
-        lagrange_multiplier = lagrange_multiplier.squeeze(-1)
-
-        loss_lagrange = - lagrange_multiplier * cost_dev
-        loss_lagrange = loss_lagrange.mean()
-
-        return loss_lagrange.item(), mean_distance.mean().item(), allow_distance.mean().item(), cost_dev.mean().item()
-
-    def compute_loss_critic(
-        self,
-        observations,
-        actions,
-        rewards,
-        next_observations,
-        done,
-        observation_features: Tensor | None = None,
-        next_observation_features: Tensor | None = None,
-    ) -> Tensor:
-        with torch.no_grad():
-            next_action_preds, *_ = self.actor_target(next_observations, next_observation_features)
-			
-            q_targets = self.critic_forward(
-                observations=next_observations,
-                actions=next_action_preds,
-                use_target=True,
-                observation_features=next_observation_features,
-            )
-
-            # subsample critics to prevent overfitting if use high UTD (update to date)
-            # TODO: Get indices before forward pass to avoid unnecessary computation
-            if self.config.num_subsample_critics is not None:
-                indices = torch.randperm(self.config.num_critics)
-                indices = indices[: self.config.num_subsample_critics]
-                q_targets = q_targets[indices]
-
-            # critics subsample size
-            min_q, _ = q_targets.min(dim=0)  # Get values from min operation
-            # Compute the final target Q value (TD Target): r + γ*(1-done)*min_q
-            td_target = rewards + (1 - done) * self.config.discount * min_q
-
-
-        actions = actions[:, :self.continuous_action_dim]
-        q_preds = self.critic_forward(
-            observations=observations,
-            actions=actions,
-            use_target=False,
-            observation_features=observation_features,
-        )
-
-        td_target_duplicate = einops.repeat(td_target, "b -> e b", e=q_preds.shape[0])
-        critics_loss = (
-            F.mse_loss(
-                input=q_preds,
-                target=td_target_duplicate,
-                reduction="none",
-            ).mean(dim=1)
-        ).sum().item()
-
-        return critics_loss
-    
-
+    # todo1:compute_loss_discrete_actor nll
     def compute_loss_discrete_actor(
         self,
         observations,
@@ -385,64 +225,70 @@ class SiLRIPolicy(
         is_intervention: Tensor | None = None,
         old_actions: Tensor | None = None
     ):
-        actions_discrete: Tensor = old_actions[:, self.continuous_action_dim:].clone()
+        # NOTE: We only want to keep the discrete action part
+        # In the buffer we have the full action space (continuous + discrete)
+        # We need to split them before concatenating them in the critic forward
+        # ============= todo: add bc loss to discrete critic =============
+        # 提取真实的离散动作部分并转换为整数标签
+        N = old_actions.shape[0]
+        old_actions = old_actions.reshape(N, 2, -1)
+        actions_discrete = old_actions[:, :, -1:]
+        actions_discrete = actions_discrete.reshape(N, -1)
+
         actions_discrete = torch.round(actions_discrete)
         actions_discrete = actions_discrete.long()
-        actions_discrete = actions_discrete.squeeze(-1)
+        actions_discrete = actions_discrete.squeeze(-1)  # batch_size,) 1维张量
+        # print('actions_discrete:', actions_discrete.shape) (256)
+        # 当前预测的夹爪动作
         actions_pi = self.discrete_actor(observations, observation_features)
-
-        mask = is_intervention == 1
-        actions_pi = actions_pi[mask]
-        actions_discrete = actions_discrete[mask]
-        discrete_loss = F.cross_entropy(actions_pi, actions_discrete, reduction="none")
-
-        
-        discrete_loss = discrete_loss.mean().item()
+        actions_pi = actions_pi.permute(0, 2, 1)
+        discrete_loss = F.cross_entropy(actions_pi, actions_discrete.long(), reduction="none")
+        discrete_loss = discrete_loss.sum(dim=-1).mean().item()
         return {
             "loss_actor": discrete_loss
         }
          
  
+    """
+    hg_dagger属于模仿学习，actor loss即bc loss
+    随机性策略不再采用mse loss
+    """
+    # todo2:去掉夹爪action loss的计算
     def compute_loss_actor(
         self,
         observations,
-        observation_features: Tensor | None = None
-    ) -> Tensor:    
-
-        with torch.no_grad():
-            lagrange_multiplier = self.lagrange_net(observations, observation_features=observation_features)
-            lagrange_multiplier = lagrange_multiplier.squeeze(-1) 
-            _, _, expert_actions = self.expert_network(observations, observation_features) 
-
-        _, _, model_actions = self.actor(observations, observation_features)
+        observation_features: Tensor | None = None,
+        is_intervention: Tensor | None = None,
+        old_actions: Tensor | None = None,
+    ) -> Tensor:
+        single_arm_continuous_action_dim = self.continuous_action_dim // 2
+        N = old_actions.shape[0]
+        old_actions = old_actions.reshape(N, 2, -1)
+        old_continous_actions = old_actions[:, :, 0:self.continuous_action_dim//2]
+        old_continous_actions = old_continous_actions.reshape(N, -1)
         
-        combine_BC = (expert_actions - model_actions).pow(2).sum(dim=-1).sqrt()
-    
+        log_probs = self.actor.get_log_probs(observations, old_continous_actions, observation_features)
 
-        q_preds = self.critic_forward(
-            observations=observations,
-            actions=model_actions,
-            use_target=False,
-            observation_features=observation_features,
-        )
+        bc_loss = - log_probs
 
-        min_q_preds = - q_preds.min(dim=0)[0]
+        bc_loss = bc_loss.mean().item()
 
-        actor_loss  = (min_q_preds + combine_BC * lagrange_multiplier) / (1 + lagrange_multiplier)
-        actor_loss = actor_loss.mean().item()
+        _, _, expert_std = self.actor.get_dist(observations, observation_features)
+        allow_distance = expert_std.sum(dim=-1)
 
-        min_q_preds = min_q_preds.mean().detach().item()
-        bc_loss = combine_BC.mean().detach().item()
-        
-        lagrange_multiplier_value = lagrange_multiplier.mean().item()
-        
+
+     
+
+        # ============ todo: add to_goal_probs to min_q_preds ============
+        # actor_loss = - min_q_preds + bc_loss
+        actor_loss = bc_loss
         return {
             "loss_actor": actor_loss,
             "bc_loss": bc_loss,
-            "min_q_preds": min_q_preds,
-            'lagrange_multiplier_value': lagrange_multiplier_value,
+            "min_q_preds": actor_loss.clone().detach(),
+            "allow_d": allow_distance.mean().item()
         }
-
+    
 
     def _init_normalization(self, dataset_stats):
         """Initialize input/output normalization modules."""
@@ -468,61 +314,18 @@ class SiLRIPolicy(
             else SACObservationEncoder(self.config, self.normalize_inputs)
         )
 
-    def _init_critics(self, continuous_action_dim):
-        """Build critic ensemble, targets, and optional discrete critic."""
-        heads = [
-            CriticHead(
-                input_dim=self.encoder_critic.output_dim + continuous_action_dim,
-                **asdict(self.config.critic_network_kwargs),
-            )
-            for _ in range(self.config.num_critics)
-        ]
-        self.critic_ensemble = CriticEnsemble(
-            encoder=self.encoder_critic, ensemble=heads, output_normalization=self.normalize_targets
-        )
-        target_heads = [
-            CriticHead(
-                input_dim=self.encoder_critic.output_dim + continuous_action_dim,
-                **asdict(self.config.critic_network_kwargs),
-            )
-            for _ in range(self.config.num_critics)
-        ]
-        self.critic_target = CriticEnsemble(
-            encoder=self.encoder_critic, ensemble=target_heads, output_normalization=self.normalize_targets
-        )
-        self.critic_target.load_state_dict(self.critic_ensemble.state_dict())
 
-        if self.config.use_torch_compile:
-            self.critic_ensemble = torch.compile(self.critic_ensemble)
-            self.critic_target = torch.compile(self.critic_target)
-
-
-
-    def _init_lagrange_network(self, ):
-        """Build lagrange ensemble, targets, and optional discrete critic."""
-        lagrange_network_kwargs = copy.deepcopy(self.config.critic_network_kwargs)
-        lagrange_network_kwargs.init_final = 0.0
-        lagrange_network_kwargs.final_activation = nn.Identity()
-        heads = CriticHead(
-                input_dim=self.encoder_critic.output_dim,
-                **asdict(lagrange_network_kwargs),
-            )
-        lagrange_encoder = SACObservationEncoder(self.config, self.normalize_inputs)
-   
-        self.lagrange_net = ValueEnsemble(
-            encoder=lagrange_encoder, ensemble=heads, output_normalization=nn.Softplus()
-        )
-
-    
-    # todo3: initialize discrete_actor
+    # todo3:初始化discrete_actor
     def _init_discrete_actor(self):
         """Build discrete discrete critic ensemble and target networks."""
-        self.discrete_actor = DiscreteCritic(
+        self.discrete_actor = DiscreteCriticDualArm(
             encoder=self.encoder_actor,
             input_dim=self.encoder_actor.output_dim,
             output_dim=self.config.num_discrete_actions,
             **asdict(self.config.discrete_actor_network_kwargs),
         )
+
+
 
     def _init_actor(self, continuous_action_dim):
         """Initialize policy actor network and default target entropy."""
@@ -532,37 +335,12 @@ class SiLRIPolicy(
             network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
             action_dim=continuous_action_dim,
             encoder_is_shared=self.shared_encoder,
-            fixed_std=torch.tensor([5e-2]).to("cuda:0"),
+            # fixed_std=torch.tensor([5e-3]).to("cuda:0"),
             **asdict(self.config.policy_kwargs),
         )
         if self.config.num_discrete_actions is not None:
             self._init_discrete_actor()
         
-        self.actor_target = Policy(
-            encoder=self.encoder_actor,
-            network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
-            action_dim=continuous_action_dim,
-            encoder_is_shared=self.shared_encoder,
-            fixed_std=torch.tensor([5e-2]).to("cuda:0"),
-            **asdict(self.config.policy_kwargs),
-        )
-        self.actor_target.load_state_dict(self.actor.state_dict())
-
-
-
-
-    def _init_expert_network(self, continuous_action_dim):
-        """Initialize policy actor network and default target entropy."""
-        # NOTE: The actor select only the continuous action part
-        self.encoder_expert = SACObservationEncoder(self.config, self.normalize_inputs)
-        self.expert_network = Policy(
-            encoder=self.encoder_expert,
-            network=MLP(input_dim=self.encoder_expert.output_dim, **asdict(self.config.actor_network_kwargs)),
-            action_dim=continuous_action_dim,
-            encoder_is_shared=self.shared_encoder,
-            fixed_std=None,
-            **asdict(self.config.policy_kwargs),
-        )
 
         
 
@@ -572,8 +350,10 @@ class Policy(nn.Module):
         encoder: SACObservationEncoder,
         network: nn.Module,
         action_dim: int,
-        std_min: float = -5,
-        std_max: float = 2,
+        std_min: float = 1e-5,
+        std_max: float = 10,
+        # std_min: float = -5,
+        # std_max: float = 2,
         fixed_std: torch.Tensor | None = None,
         init_final: float | None = None,
         use_tanh_squash: bool = False,
@@ -589,6 +369,9 @@ class Policy(nn.Module):
         self.fixed_std = fixed_std
         self.use_tanh_squash = use_tanh_squash
         self.encoder_is_shared = encoder_is_shared
+
+        # print('std_min:', std_min, 'std_max:', std_max)
+        # input("Press Enter to continue...")
 
         # Find the last Linear layer's output dimension
         for layer in reversed(network.net):
@@ -619,22 +402,26 @@ class Policy(nn.Module):
         observation_features: torch.Tensor | None = None,
         n=1
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Better do not detach the encoder to ensure enough parameters to fit data
+        # We detach the encoder if it is shared to avoid backprop through it
+        # This is important to avoid the encoder to be updated through the policy
+        # 通过编码器（如神经网络）处理，提取有用特征
+        # print("observations.observation.images.right:", observations.observation.images.right.shape)
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
 
         # Get network outputs
-        # Outputs and mean calculation
+        # 网络输出与均值计算
         outputs = self.network(obs_enc)
 
         means = self.mean_layer(outputs)
 
         """
-        means through tanh squashing
+        means经过tanh放缩
         """
         means = torch.tanh(means)
 
         # Compute standard deviations
-        # Standard deviation calculation
+        # 标准差计算
+
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
     
@@ -647,25 +434,40 @@ class Policy(nn.Module):
         
 
         # Build transformed distribution
-        # Build a multivariate normal distribution with a diagonal covariance matrix
+        # 构建一个对角线协方差的多元正态分布
+        # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+
+        """
+        采用多元正态分布
+        """
         dist = MultivariateNormalDiag(loc=means, scale_diag=std)
 
         # Sample actions (reparameterized)
-        # Action sampling
+        # 动作采样
         if n == 1:
             actions = dist.rsample()
             """
-            Clip actions
+            裁剪动作
             """
             log_probs = dist.log_prob(actions) # torch.Size([batch_size, action_dim])
         else:
             """
-            Sample multiple samples
+            采样多个样本
             """
             actions = dist.rsample(sample_shape=(n,)) # torch.Size([n, batch_size, action_dim])
+            # reshape -> [B, action_dim]
+            # actions=actions.reshape(-1, actions.shape[-1])
+            # print("调整后actions尺寸: ", actions.shape)
+
+            # 为每个样本计算对数概率
             log_probs = torch.stack([dist.log_prob(actions[i]) for i in range(n)])
-            log_probs = dist.log_prob(actions)
+            log_probs = dist.log_prob(actions) # torch.Size([n*batch_size, action_dim])
             
+            # reshape -> [n, batch_size, action_dim]
+            # log_probs = log_probs.reshape(n, -1, log_probs.shape[-1])
+       
+     
+    
         return actions, log_probs, means
 
     def get_dist(
@@ -675,64 +477,22 @@ class Policy(nn.Module):
     ):
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
-        # Process through the encoder (e.g., neural network) to extract useful features
+        # 通过编码器（如神经网络）处理，提取有用特征
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
       
         # Get network outputs
-        # Outputs and mean calculation
+        # 网络输出与均值计算
         outputs = self.network(obs_enc)
       
         means = self.mean_layer(outputs)
 
         """
-        means through tanh squashing
+        means经过tanh放缩
         """
         means = torch.tanh(means)
 
         # Compute standard deviations
-        # Standard deviation calculation
-    
-        if self.fixed_std is None:
-            log_std = self.std_layer(outputs)
-            std = torch.exp(log_std)  # Match JAX "exp"
-            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
-        else:
-            std = self.fixed_std.expand_as(means)
-
-        """
-        Use multivariate normal distribution
-        """
-        dist = MultivariateNormalDiag(loc=means, scale_diag=std)
-
-        return dist, means, std
-
-    """
-    Compute log probabilities for given states and actions
-    """
-    def get_log_probs(
-        self,
-        observations: torch.Tensor,
-        actions: torch.Tensor,
-        observation_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # We detach the encoder if it is shared to avoid backprop through it
-        # This is important to avoid the encoder to be updated through the policy
-        # Process through the encoder (e.g., neural network) to extract useful features
-        obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
-      
-        # Get network outputs
-        # Outputs and mean calculation
-        outputs = self.network(obs_enc)
-      
-        means = self.mean_layer(outputs)
-
-        """
-        means through tanh squashing
-        """
-        means = torch.tanh(means)
-
-        # Compute standard deviations
-        # Standard deviation calculation
+        # 标准差计算
     
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
@@ -742,24 +502,83 @@ class Policy(nn.Module):
             std = self.fixed_std.expand_as(means)
 
         # Build transformed distribution
-        # Build a multivariate normal distribution with a diagonal covariance matrix
+        # 构建一个对角线协方差的多元正态分布
         # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
         """
-        Use multivariate normal distribution
+        采用多元正态分布
         """
         dist = MultivariateNormalDiag(loc=means, scale_diag=std)
 
+        return dist, means, std
 
-        if actions.dim() == 2:  # Single action: [batch_size, action_dim]
+    """
+    add 2:计算给定状态和动作下的对数概率
+    """
+    def get_log_probs(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        observation_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # We detach the encoder if it is shared to avoid backprop through it
+        # This is important to avoid the encoder to be updated through the policy
+        # 通过编码器（如神经网络）处理，提取有用特征
+        obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
+      
+        # Get network outputs
+        # 网络输出与均值计算
+        outputs = self.network(obs_enc)
+      
+        means = self.mean_layer(outputs)
+
+        """
+        means经过tanh放缩
+        """
+        means = torch.tanh(means)
+
+        # Compute standard deviations
+        # 标准差计算
+    
+        if self.fixed_std is None:
+            log_std = self.std_layer(outputs)
+            std = torch.exp(log_std)  # Match JAX "exp"
+            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
+        else:
+            std = self.fixed_std.expand_as(means)
+
+        # Build transformed distribution
+        # 构建一个对角线协方差的多元正态分布
+        # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        """
+        采用多元正态分布
+        """
+        dist = MultivariateNormalDiag(loc=means, scale_diag=std)
+
+        # 裁剪动作以保持与forward函数一致
+        # epsilon = 1e-6
+        # actions = torch.clamp(actions, -1+epsilon, 1-epsilon)
+        
+        # Compute log_probs
+        # 计算采样动作的对数概率
+        if actions.dim() == 2:  # 单个动作: [batch_size, action_dim]
             log_probs = dist.log_prob(actions)
-        elif actions.dim() == 3:  # Multiple actions: [n, batch_size, action_dim]
-            # Compute log probabilities for each sample
+        elif actions.dim() == 3:  # 多个动作: [n, batch_size, action_dim]
+            # 为每个样本计算对数概率
             n = actions.shape[0]
             log_probs = torch.stack([dist.log_prob(actions[i]) for i in range(n)])
+           
+            # actions=actions.reshape(-1, actions.shape[-1])
+            # print("调整后actions尺寸: ", actions.shape)
+            # log_probs = dist.log_prob(actions) # torch.Size([n*batch_size, action_dim])
+            # log_probs = log_probs.reshape(n, -1, log_probs.shape[-1])
+        
         else:
             raise ValueError(f"Unexpected actions dimension: {actions.dim()}")
        
-
+        if log_probs.abs().mean() > 100:
+            print('actions:', actions)
+            print('means:', means)
+            print('log_probs:', log_probs)
         return log_probs
     
     def print_params(self):
@@ -773,18 +592,18 @@ class Policy(nn.Module):
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
       
         # Get network outputs
-        # Outputs and mean calculation
+        # 网络输出与均值计算
         outputs = self.network(obs_enc)
       
         means = self.mean_layer(outputs)
 
         """
-        means through tanh squashing
+        means经过tanh放缩
         """
         means = torch.tanh(means)
 
         # Compute standard deviations
-        # Standard deviation calculation    
+        # 标准差计算    
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
             std = torch.exp(log_std)  # Match JAX "exp"
@@ -794,11 +613,11 @@ class Policy(nn.Module):
         
 
         # Build transformed distribution
-        # Build a multivariate normal distribution with a diagonal covariance matrix
+        # 构建一个对角线协方差的多元正态分布
         # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
 
         """
-        Use multivariate normal distribution
+        采用多元正态分布
         """
 
         dist = MultivariateNormalDiag(loc=means, scale_diag=std)
@@ -861,57 +680,5 @@ class MultivariateNormalDiag(MultivariateNormal):
         return super().entropy()
 
 
-
-
-class ValueEnsemble(nn.Module):
-    """
-    ValueEnsemble wraps multiple CriticHead modules into an ensemble.
-
-    Args:
-        encoder (SACObservationEncoder): encoder for observations.
-        ensemble (List[CriticHead]): list of critic heads.
-        output_normalization (nn.Module): normalization layer for actions.
-        init_final (float | None): optional initializer scale for final layers.
-
-    Forward returns a tensor of shape (num_critics, batch_size) containing V-values.
-    """
-
-    def __init__(
-        self,
-        encoder: SACObservationEncoder,
-        ensemble: CriticHead,
-        output_normalization: nn.Module,
-        init_final: float | None = None,
-    ):
-        super().__init__()
-        self.encoder = encoder
-        self.init_final = init_final
-        self.output_normalization = output_normalization
-        self.critics = ensemble
-
-
-    def forward(
-        self,
-        observations: dict[str, torch.Tensor],
-        observation_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        device = get_device_from_parameters(self)
-        # Move each tensor in observations to device
-        observations = {k: v.to(device) for k, v in observations.items()}
-
-        obs_enc = self.encoder(observations, cache=observation_features)
-
-        inputs = obs_enc
-
-        q_values = self.critics(inputs)
-        # Loop through critics and collect outputs
-        # q_values = []
-        # for critic in self.critics:
-        #     q_values.append(critic(inputs))
-
-        # # Stack outputs to match expected shape [num_critics, batch_size]
-        # q_values = torch.stack([q.squeeze(-1) for q in q_values], dim=0)
-        q_values = self.output_normalization(q_values)
-        return q_values
 
 

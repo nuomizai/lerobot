@@ -35,7 +35,9 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.hgdagger.configuration_hgdagger import HGDaggerConfig
+from lerobot.policies.hgdagger_dualarm.configuration_hgdagger_dualarm import HGDaggerDualArmConfig
 from lerobot.policies.silri.configuration_silri import SiLRIConfig
+from lerobot.policies.silri_dualarm.configuration_silri_dualarm import SiLRIDualArmConfig
 
 def get_policy_class(name: str) -> PreTrainedPolicy:
     print(f"--------------------------> name: {name}")
@@ -72,10 +74,18 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
         from lerobot.policies.hgdagger.modeling_hgdagger import HGDaggerPolicy
 
         return HGDaggerPolicy
+    elif name == "hgdagger_dualarm":
+        from lerobot.policies.hgdagger_dualarm.modeling_hgdagger_dualarm import HGDaggerDualArmPolicy
+
+        return HGDaggerDualArmPolicy
     elif name == "silri":
         from lerobot.policies.silri.modeling_silri import SiLRIPolicy
 
         return SiLRIPolicy
+    elif name == "silri_dualarm":
+        from lerobot.policies.silri_dualarm.modeling_silri_dualarm import SiLRIDualArmPolicy
+
+        return SiLRIDualArmPolicy
     elif name == "reward_classifier":
         from lerobot.policies.sac.reward_model.modeling_classifier import Classifier
 
@@ -109,8 +119,12 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return RewardClassifierConfig(**kwargs)
     elif policy_type == "hgdagger":
         return HGDaggerConfig(**kwargs)
+    elif policy_type == "hgdagger_dualarm":
+        return HGDaggerDualArmConfig(**kwargs)
     elif policy_type == "silri":
         return SiLRIConfig(**kwargs)
+    elif policy_type == "silri_dualarm":
+        return SiLRIDualArmConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 
@@ -170,9 +184,12 @@ def make_policy(
                 "by default without stats from a dataset."
             )
         features = env_to_policy_features(env_cfg)
-
-    cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+    if not cfg.output_features:
+        cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    
+    
+    if not cfg.input_features:
+        cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
     
     
     kwargs["config"] = cfg

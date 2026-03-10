@@ -327,7 +327,7 @@ class SACPolicy(
                 target=td_target_duplicate,
                 reduction="none",
             ).mean(dim=1)
-        ).sum()
+        ).sum().item()
         return critics_loss
 
     def compute_loss_discrete_critic(
@@ -395,7 +395,7 @@ class SACPolicy(
         
         discrete_critic_loss = F.mse_loss(input=predicted_discrete_q, target=target_discrete_q)
 
-        return discrete_critic_loss
+        return discrete_critic_loss.item()
 
     def compute_loss_temperature(self, observations, observation_features: Tensor | None = None) -> Tensor:
         """Compute the temperature loss"""
@@ -403,7 +403,7 @@ class SACPolicy(
         with torch.no_grad():
             _, log_probs, _ = self.actor(observations, observation_features)
         temperature_loss = (-self.log_alpha.exp() * (log_probs + self.target_entropy)).mean()
-        return temperature_loss
+        return temperature_loss.item()
 
     def compute_loss_actor(
         self,
@@ -421,7 +421,7 @@ class SACPolicy(
         min_q_preds = q_preds.min(dim=0)[0]
 
         actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
-        return actor_loss
+        return actor_loss.item()
 
     def _init_normalization(self, dataset_stats):
         """Initialize input/output normalization modules."""

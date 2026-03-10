@@ -236,7 +236,7 @@ class HGDaggerPolicy(
         actions_pi = self.discrete_actor(observations, observation_features)
         # print('actions_pi:', actions_pi.shape) (256, 2)
         discrete_loss = F.nll_loss(actions_pi, actions_discrete, reduction="none")
-        discrete_loss = discrete_loss.mean()
+        discrete_loss = discrete_loss.mean().item()
         return {
             "loss_actor": discrete_loss
         }
@@ -258,7 +258,7 @@ class HGDaggerPolicy(
         log_probs = self.actor.get_log_probs(observations, old_actions[:, 0:self.continuous_action_dim], observation_features)
         bc_loss = - log_probs
 
-        bc_loss = bc_loss.mean()
+        bc_loss = bc_loss.mean().item()
 
         actor_loss = bc_loss
         return {

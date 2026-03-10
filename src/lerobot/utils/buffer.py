@@ -527,7 +527,7 @@ class ReplayBuffer:
                 first_complementary_info = {
                     k: v.to(device) for k, v in first_transition["complementary_info"].items()
                 }
-
+            
             
             replay_buffer._initialize_storage(
                 state=first_state, action=first_action, complementary_info=first_complementary_info
