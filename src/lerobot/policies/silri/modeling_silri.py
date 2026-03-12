@@ -323,7 +323,7 @@ class SiLRIPolicy(
         loss_lagrange = - lagrange_multiplier * cost_dev
         loss_lagrange = loss_lagrange.mean()
 
-        return loss_lagrange.item(), mean_distance.mean().item(), allow_distance.mean().item(), cost_dev.mean().item()
+        return loss_lagrange, mean_distance.mean().item(), allow_distance.mean().item(), cost_dev.mean().item()
 
     def compute_loss_critic(
         self,
@@ -373,7 +373,7 @@ class SiLRIPolicy(
                 target=td_target_duplicate,
                 reduction="none",
             ).mean(dim=1)
-        ).sum().item()
+        ).sum()
 
         return critics_loss
     
@@ -397,7 +397,7 @@ class SiLRIPolicy(
         discrete_loss = F.cross_entropy(actions_pi, actions_discrete, reduction="none")
 
         
-        discrete_loss = discrete_loss.mean().item()
+        discrete_loss = discrete_loss.mean()
         return {
             "loss_actor": discrete_loss
         }
@@ -429,16 +429,16 @@ class SiLRIPolicy(
         min_q_preds = - q_preds.min(dim=0)[0]
 
         actor_loss  = (min_q_preds + combine_BC * lagrange_multiplier) / (1 + lagrange_multiplier)
-        actor_loss = actor_loss.mean().item()
+        actor_loss = actor_loss.mean()
 
-        min_q_preds = min_q_preds.mean().detach().item()
-        bc_loss = combine_BC.mean().detach().item()
+        min_q_preds = min_q_preds.mean().detach()
+        bc_loss = combine_BC.mean().detach()
         
         lagrange_multiplier_value = lagrange_multiplier.mean().item()
         
         return {
             "loss_actor": actor_loss,
-            "bc_loss": bc_loss,
+            "bc_loss": bc_loss.item(),
             "min_q_preds": min_q_preds,
             'lagrange_multiplier_value': lagrange_multiplier_value,
         }

@@ -33,7 +33,7 @@ import copy
 from lerobot.policies.normalize import NormalizeBuffer
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters
-from lerobot.policies.sac.modeling_sac import SACObservationEncoder, CriticHead, CriticEnsemble, DiscreteCriticDualArm, MLP
+from lerobot.policies.sac.modeling_sac import SACObservationEncoder, CriticHead, CriticEnsemble, MLP
 from lerobot.policies.silri_dualarm.configuration_silri_dualarm import SiLRIDualArmConfig
 
 def print_green(x: any) -> None:
@@ -355,7 +355,7 @@ class SiLRIDualArmPolicy(
 
         loss_lagrange = loss_lagrange.mean()
 
-        return loss_lagrange.item(), mean_distance.mean().item(), allow_distance.mean().item(), cost_dev.mean().item()
+        return loss_lagrange, mean_distance.mean().item(), allow_distance.mean().item(), cost_dev.mean().item()
 
     def compute_loss_critic(
         self,
@@ -409,7 +409,7 @@ class SiLRIDualArmPolicy(
                 target=td_target_duplicate,
                 reduction="none",
             ).mean(dim=1)
-        ).sum().item()
+        ).sum()
 
         return critics_loss
     
@@ -467,7 +467,7 @@ class SiLRIDualArmPolicy(
 
 
         discrete_loss = F.cross_entropy(actions_pi, actions_discrete.long(), reduction="none")
-        discrete_loss = discrete_loss.sum(dim=-1).mean().item()
+        discrete_loss = discrete_loss.sum(dim=-1).mean()
         
         return {
             "loss_actor": discrete_loss
@@ -500,16 +500,16 @@ class SiLRIDualArmPolicy(
         min_q_preds = - q_preds.min(dim=0)[0]
 
         actor_loss  = (min_q_preds + combine_BC * lagrange_multiplier) / (1 + lagrange_multiplier)
-        actor_loss = actor_loss.mean().item()
+        actor_loss = actor_loss.mean()
 
         min_q_preds = min_q_preds.mean().detach().item()
-        bc_loss = combine_BC.mean().detach().item()
+        bc_loss = combine_BC.mean().detach()
         
         lagrange_multiplier_value = lagrange_multiplier.mean().item()
         
         return {
             "loss_actor": actor_loss,
-            "bc_loss": bc_loss,
+            "bc_loss": bc_loss.item(),
             "min_q_preds": min_q_preds,
             'lagrange_multiplier_value': lagrange_multiplier_value,
         }
@@ -588,7 +588,7 @@ class SiLRIDualArmPolicy(
     # todo3: initialize discrete_actor
     def _init_discrete_actor(self):
         """Build discrete discrete critic ensemble and target networks."""
-        self.discrete_actor = DiscreteCriticDualArm(
+        self.discrete_actor = DiscreteActorDualArm(
             encoder=self.encoder_actor,
             input_dim=self.encoder_actor.output_dim,
             output_dim=self.config.num_discrete_actions,
@@ -889,7 +889,54 @@ class Policy(nn.Module):
         return observations
 
 
+class DiscreteActorDualArm(nn.Module):
+    def __init__(
+        self,
+        encoder: nn.Module,
+        input_dim: int,
+        hidden_dims: list[int],
+        output_dim: int = 3,
+        activations: Callable[[torch.Tensor], torch.Tensor] | str = nn.SiLU(),
+        activate_final: bool = False,
+        dropout_rate: float | None = None,
+        init_final: float | None = None,
+        final_activation: Callable[[torch.Tensor], torch.Tensor] | str | None = None,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.output_dim = output_dim
+        self.net = MLP(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            activations=activations,
+            activate_final=activate_final,
+            dropout_rate=dropout_rate,
+            final_activation=final_activation,
+        )
 
+        self.output_layer1 = nn.Linear(in_features=hidden_dims[-1], out_features=self.output_dim)
+        self.output_layer2 = nn.Linear(in_features=hidden_dims[-1], out_features=self.output_dim)
+        if init_final is not None:
+            nn.init.uniform_(self.output_layer1.weight, -init_final, init_final)
+            nn.init.uniform_(self.output_layer1.bias, -init_final, init_final)
+        else:
+            orthogonal_init()(self.output_layer1.weight)
+        if init_final is not None:
+            nn.init.uniform_(self.output_layer2.weight, -init_final, init_final)
+            nn.init.uniform_(self.output_layer2.bias, -init_final, init_final)
+        else:
+            orthogonal_init()(self.output_layer2.weight)
+
+    def forward(
+        self, observations: torch.Tensor, observation_features: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        device = get_device_from_parameters(self)
+        observations = {k: v.to(device) for k, v in observations.items()}
+        obs_enc = self.encoder(observations, cache=observation_features)
+        action1_value = self.output_layer1(self.net(obs_enc)).unsqueeze(dim=1)
+        action2_value = self.output_layer2(self.net(obs_enc)).unsqueeze(dim=1)
+        value = torch.cat([action1_value, action2_value], dim=1)
+        return value
 
 def orthogonal_init():
     return lambda x: torch.nn.init.orthogonal_(x, gain=1.0)

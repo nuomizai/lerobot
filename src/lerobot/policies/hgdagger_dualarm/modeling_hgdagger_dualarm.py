@@ -32,7 +32,8 @@ import cv2
 from lerobot.policies.normalize import NormalizeBuffer
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters
-from lerobot.policies.sac.modeling_sac import SACObservationEncoder, MLP, DiscreteCriticDualArm
+from lerobot.policies.sac.modeling_sac import SACObservationEncoder, MLP
+from lerobot.policies.silri_dualarm.modeling_silri_dualarm import DiscreteActorDualArm
 from lerobot.policies.hgdagger_dualarm.configuration_hgdagger_dualarm import HGDaggerDualArmConfig
 
 
@@ -243,7 +244,7 @@ class HGDaggerDualArmPolicy(
         actions_pi = self.discrete_actor(observations, observation_features)
         actions_pi = actions_pi.permute(0, 2, 1)
         discrete_loss = F.cross_entropy(actions_pi, actions_discrete.long(), reduction="none")
-        discrete_loss = discrete_loss.sum(dim=-1).mean().item()
+        discrete_loss = discrete_loss.sum(dim=-1).mean()
         return {
             "loss_actor": discrete_loss
         }
@@ -271,7 +272,7 @@ class HGDaggerDualArmPolicy(
 
         bc_loss = - log_probs
 
-        bc_loss = bc_loss.mean().item()
+        bc_loss = bc_loss.mean()
 
         _, _, expert_std = self.actor.get_dist(observations, observation_features)
         allow_distance = expert_std.sum(dim=-1)
@@ -318,7 +319,7 @@ class HGDaggerDualArmPolicy(
     # todo3:初始化discrete_actor
     def _init_discrete_actor(self):
         """Build discrete discrete critic ensemble and target networks."""
-        self.discrete_actor = DiscreteCriticDualArm(
+        self.discrete_actor = DiscreteActorDualArm(
             encoder=self.encoder_actor,
             input_dim=self.encoder_actor.output_dim,
             output_dim=self.config.num_discrete_actions,
