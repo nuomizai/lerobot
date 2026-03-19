@@ -33,19 +33,21 @@ import copy
 from lerobot.policies.normalize import NormalizeBuffer
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters
-from lerobot.policies.sac.modeling_sac import SACObservationEncoder, CriticHead, CriticEnsemble, DiscreteCritic, MLP
-from lerobot.policies.silri.configuration_silri import SiLRIConfig
+from lerobot.policies.sac.modeling_sac import SACObservationEncoder, CriticHead, CriticEnsemble, MLP
+from lerobot.policies.silri_dualarm.configuration_silri_dualarm import SiLRIDualArmConfig
 
+def print_green(x: any) -> None:
+    return print("\033[92m {}\033[00m".format(x))
 
-class SiLRIPolicy(
+class SiLRIDualArmPolicy(
     PreTrainedPolicy,
 ):
-    config_class = SiLRIConfig
-    name = "silri"
+    config_class = SiLRIDualArmConfig
+    name = "silri_dualarm"
 
     def __init__(
         self,
-        config: SiLRIConfig | None = None,
+        config: SiLRIDualArmConfig | None = None,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
         super().__init__(config)
@@ -121,9 +123,24 @@ class SiLRIPolicy(
         # 若有离散动作，离散Critic输出各动作价值，选价值最大的动作
         # todo11
         if self.config.num_discrete_actions is not None:
+            # discrete_action_value = self.discrete_critic(batch, observations_features)
             discrete_action_value = self.discrete_actor(batch, observations_features)
+
+            # (1, 2, 1)
             discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+
+            print_discrete_action_value = discrete_action_value.squeeze(-1)
+            print_discrete_action_prob = F.softmax(print_discrete_action_value, dim=-1).cpu().detach().numpy()
+            print_discrete_action = discrete_action.squeeze(-1).reshape(-1, 2).cpu().detach().numpy()
+            print_green(f"discrete_action_prob: {print_discrete_action_prob}, select_discrete_action: {print_discrete_action}")
+
+            # (1， 2， 6) 
+            actions = actions.reshape(-1, 2, self.continuous_action_dim//2)
+            # (1, 2, 7)
             actions = torch.cat([actions, discrete_action], dim=-1)
+            # (1, 14)
+            actions = actions.reshape(-1, self.continuous_action_dim+2)
+
         return actions, {}
 
     def critic_forward(
@@ -286,7 +303,13 @@ class SiLRIPolicy(
             )
 
     def compute_loss_expert(self, observations, actions, observation_features: Tensor | None = None, is_intervention: Tensor | None = None) -> Tensor:
-        log_probs = self.expert_network.get_log_probs(observations, actions[:, 0:self.continuous_action_dim], observation_features)
+        N = actions.shape[0]
+        old_actions = actions.reshape(N, 2, -1).clone()
+        old_continous_actions = old_actions[:, :, 0:self.continuous_action_dim//2]
+        actions = old_continous_actions.reshape(N, -1)
+
+
+        log_probs = self.expert_network.get_log_probs(observations, actions, observation_features)
         
         loss_expert = - log_probs * is_intervention
         loss_expert = loss_expert.sum() / is_intervention.sum().item()
@@ -296,7 +319,13 @@ class SiLRIPolicy(
         return loss_expert, allow_distance  
 
     def compute_loss_actor_bc(self, observations, actions, observation_features: Tensor | None = None, is_intervention: Tensor | None = None) -> Tensor:
-        log_probs = self.actor.get_log_probs(observations, actions[:, 0:self.continuous_action_dim], observation_features)
+        N = actions.shape[0]
+        old_actions = actions.reshape(N, 2, -1).clone()
+        old_continous_actions = old_actions[:, :, 0:self.continuous_action_dim//2]
+        actions = old_continous_actions.reshape(N, -1)
+
+
+        log_probs = self.actor.get_log_probs(observations, actions, observation_features)
         loss_actor_bc = - log_probs * is_intervention
         loss_actor_bc = loss_actor_bc.sum() / is_intervention.sum().item()
         return {
@@ -310,17 +339,20 @@ class SiLRIPolicy(
             _, actions_expert, expert_std = self.expert_network.get_dist(observations, observation_features)
             allow_distance = expert_std.sum(dim=-1)
             _, _, actions_model = self.actor(observations, observation_features)
+
             
             mean_distance = (actions_expert - actions_model).pow(2).sum(-1).sqrt()
             cost_dev = mean_distance - allow_distance
 
 
-            cost_dev = cost_dev - 0.2
+            cost_dev = cost_dev - 0.15
 
         lagrange_multiplier = self.lagrange_net(observations, observation_features=observation_features)
         lagrange_multiplier = lagrange_multiplier.squeeze(-1)
 
         loss_lagrange = - lagrange_multiplier * cost_dev
+
+
         loss_lagrange = loss_lagrange.mean()
 
         return loss_lagrange, mean_distance.mean().item(), allow_distance.mean().item(), cost_dev.mean().item()
@@ -358,7 +390,11 @@ class SiLRIPolicy(
             td_target = rewards + (1 - done) * self.config.discount * min_q
 
 
-        actions = actions[:, :self.continuous_action_dim]
+        N = actions.shape[0]
+        old_actions = actions.reshape(N, 2, -1)
+        old_continous_actions = old_actions[:, :, 0:self.continuous_action_dim//2]
+        actions = old_continous_actions.reshape(N, -1)
+
         q_preds = self.critic_forward(
             observations=observations,
             actions=actions,
@@ -385,19 +421,54 @@ class SiLRIPolicy(
         is_intervention: Tensor | None = None,
         old_actions: Tensor | None = None
     ):
-        actions_discrete: Tensor = old_actions[:, self.continuous_action_dim:].clone()
+        N = old_actions.shape[0]
+        old_actions = old_actions.reshape(N, 2, -1)
+        actions_discrete = old_actions[:, :, -1:]
+        actions_discrete = actions_discrete.reshape(N, -1)
+        
+
         actions_discrete = torch.round(actions_discrete)
         actions_discrete = actions_discrete.long()
-        actions_discrete = actions_discrete.squeeze(-1)
+        
+        # actions_discrete: (N, 2: left,right)
+        actions_discrete = actions_discrete.squeeze(-1)  # batch_size,) 1维张量
+       
+        # 当前预测的夹爪动作: (N, 2: left, right, 2: open_logits, close_logits)
         actions_pi = self.discrete_actor(observations, observation_features)
 
+        print_action_pi = torch.argmax(actions_pi, dim=-1, keepdim=True)
+        actions_pi = actions_pi.permute(0, 2, 1)
+
+        # print_green(f"actions_pi-permute: {actions_pi[0]}")
+        # print_green(f"actions_discrete: {actions_discrete[0]}")
+
+        # print_green(f"compute_loss_discrete_actor-actions_pi: {actions_pi}")
+        # print_green(f"compute_loss_discrete_actor-actions_discrete: {actions_discrete}")
+
+        """
+        change: 只计算intervention为1的损失
+        """        
         mask = is_intervention == 1
         actions_pi = actions_pi[mask]
         actions_discrete = actions_discrete[mask]
-        discrete_loss = F.cross_entropy(actions_pi, actions_discrete, reduction="none")
 
         
-        discrete_loss = discrete_loss.mean()
+       
+        print_action_pi = print_action_pi[mask]
+        print_action_pi = print_action_pi.reshape(-1, 2)
+        accuracy = (print_action_pi == actions_discrete).float().mean().item()
+        # print_green(f"--------------------------discrete_actor-accuracy: s{accuracy}")
+        # # print('shape:', print_action_pi.shape, ' ', actions_discrete.shape)
+        # for i, _pi in enumerate(print_action_pi):
+        #     print(f"index: {i}, action_pi: {_pi.cpu().detach().numpy()}, actions_discrete: {actions_discrete[i].cpu().detach().numpy()}")
+
+        # print_green(f"compute_loss_discrete_actor-actions_pi-mask: {actions_pi.shape}")
+        # print_green(f"compute_loss_discrete_actor-actions_discrete-mask: {actions_discrete.shape}")
+
+
+        discrete_loss = F.cross_entropy(actions_pi, actions_discrete.long(), reduction="none")
+        discrete_loss = discrete_loss.sum(dim=-1).mean()
+        
         return {
             "loss_actor": discrete_loss
         }
@@ -431,7 +502,7 @@ class SiLRIPolicy(
         actor_loss  = (min_q_preds + combine_BC * lagrange_multiplier) / (1 + lagrange_multiplier)
         actor_loss = actor_loss.mean()
 
-        min_q_preds = min_q_preds.mean().detach()
+        min_q_preds = min_q_preds.mean().detach().item()
         bc_loss = combine_BC.mean().detach()
         
         lagrange_multiplier_value = lagrange_multiplier.mean().item()
@@ -517,7 +588,7 @@ class SiLRIPolicy(
     # todo3: initialize discrete_actor
     def _init_discrete_actor(self):
         """Build discrete discrete critic ensemble and target networks."""
-        self.discrete_actor = DiscreteCritic(
+        self.discrete_actor = DiscreteActorDualArm(
             encoder=self.encoder_actor,
             input_dim=self.encoder_actor.output_dim,
             output_dim=self.config.num_discrete_actions,
@@ -818,7 +889,54 @@ class Policy(nn.Module):
         return observations
 
 
+class DiscreteActorDualArm(nn.Module):
+    def __init__(
+        self,
+        encoder: nn.Module,
+        input_dim: int,
+        hidden_dims: list[int],
+        output_dim: int = 3,
+        activations: Callable[[torch.Tensor], torch.Tensor] | str = nn.SiLU(),
+        activate_final: bool = False,
+        dropout_rate: float | None = None,
+        init_final: float | None = None,
+        final_activation: Callable[[torch.Tensor], torch.Tensor] | str | None = None,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.output_dim = output_dim
+        self.net = MLP(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            activations=activations,
+            activate_final=activate_final,
+            dropout_rate=dropout_rate,
+            final_activation=final_activation,
+        )
 
+        self.output_layer1 = nn.Linear(in_features=hidden_dims[-1], out_features=self.output_dim)
+        self.output_layer2 = nn.Linear(in_features=hidden_dims[-1], out_features=self.output_dim)
+        if init_final is not None:
+            nn.init.uniform_(self.output_layer1.weight, -init_final, init_final)
+            nn.init.uniform_(self.output_layer1.bias, -init_final, init_final)
+        else:
+            orthogonal_init()(self.output_layer1.weight)
+        if init_final is not None:
+            nn.init.uniform_(self.output_layer2.weight, -init_final, init_final)
+            nn.init.uniform_(self.output_layer2.bias, -init_final, init_final)
+        else:
+            orthogonal_init()(self.output_layer2.weight)
+
+    def forward(
+        self, observations: torch.Tensor, observation_features: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        device = get_device_from_parameters(self)
+        observations = {k: v.to(device) for k, v in observations.items()}
+        obs_enc = self.encoder(observations, cache=observation_features)
+        action1_value = self.output_layer1(self.net(obs_enc)).unsqueeze(dim=1)
+        action2_value = self.output_layer2(self.net(obs_enc)).unsqueeze(dim=1)
+        value = torch.cat([action1_value, action2_value], dim=1)
+        return value
 
 def orthogonal_init():
     return lambda x: torch.nn.init.orthogonal_(x, gain=1.0)
