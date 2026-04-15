@@ -1033,8 +1033,13 @@ class PretrainedImageEncoder(nn.Module):
     def _load_pretrained_vision_encoder(self, config: SACConfig):
         """Set up CNN encoder"""
         from transformers import AutoModel
-
-        self.image_enc_layers = AutoModel.from_pretrained(config.vision_encoder_name, trust_remote_code=True)
+        
+        self.image_enc_layers = AutoModel.from_pretrained(
+            config.vision_encoder_name,
+            trust_remote_code=True,
+            revision="c587b31f2f79e653249ed4af78f0ba7dff72122c",
+        )
+        # self.image_enc_layers = AutoModel.from_pretrained(config.vision_encoder_name, trust_remote_code=True)
 
         if hasattr(self.image_enc_layers.config, "hidden_sizes"):
             self.image_enc_out_shape = self.image_enc_layers.config.hidden_sizes[-1]  # Last channel dimension
