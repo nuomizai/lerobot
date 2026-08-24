@@ -38,7 +38,9 @@ from lerobot.policies.hgdagger.configuration_hgdagger import HGDaggerConfig
 from lerobot.policies.hgdagger_dualarm.configuration_hgdagger_dualarm import HGDaggerDualArmConfig
 from lerobot.policies.silri.configuration_silri import SiLRIConfig
 from lerobot.policies.silri_dualarm.configuration_silri_dualarm import SiLRIDualArmConfig
-
+from lerobot.policies.gains.configuration_gains import GainsConfig
+from lerobot.policies.tqc.configuration_tqc import TQCConfig
+from lerobot.policies.sac_wo_img.configuration_sac_wo_img import SACWOImgConfig
 def get_policy_class(name: str) -> PreTrainedPolicy:
     print(f"--------------------------> name: {name}")
     """Get the policy's class and config class given a name (matching the policy class' `name` attribute)."""
@@ -94,6 +96,18 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "gains":
+        from lerobot.policies.gains.modeling_gains import GainsPolicy
+
+        return GainsPolicy
+    elif name == "tqc":
+        from lerobot.policies.tqc.modeling_tqc import TQCPolicy
+
+        return TQCPolicy
+    elif name == "sac_wo_img":
+        from lerobot.policies.sac_wo_img.modeling_sac_wo_img import SACPolicyWOImg
+
+        return SACPolicyWOImg
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -125,6 +139,12 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SiLRIConfig(**kwargs)
     elif policy_type == "silri_dualarm":
         return SiLRIDualArmConfig(**kwargs)
+    elif policy_type == "gains":
+        return GainsConfig(**kwargs)
+    elif policy_type == "tqc":
+        return TQCConfig(**kwargs)
+    elif policy_type == "sac_wo_img":
+        return SACWOImgConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 

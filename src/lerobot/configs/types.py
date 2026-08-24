@@ -22,6 +22,7 @@ class FeatureType(str, Enum):
     STATE = "STATE"
     VISUAL = "VISUAL"
     ENV = "ENV"
+    ENVIRONMENT_STATE = "ENVIRONMENT_STATE"
     ACTION = "ACTION"
     REWARD = "REWARD"
 

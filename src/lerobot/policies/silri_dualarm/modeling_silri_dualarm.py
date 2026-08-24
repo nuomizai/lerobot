@@ -61,24 +61,24 @@ class SiLRIDualArmPolicy(
         self.continuous_action_dim = continuous_action_dim
         
         self._init_normalization(dataset_stats)
-        # 初始化观测编码器（Actor与Critic可共享或独立）
+        # Initialize the observation encoder (shared between actor and critic, or separate)
         self._init_encoders()  
-        # 初始化Critic网络（连续动作+可选离散动作）
+        # Initialize the critic networks (continuous action + optional discrete action)
         self._init_critics(continuous_action_dim)
 
         self._init_expert_network(continuous_action_dim)
         self._init_lagrange_network()
 
-        # 初始化Actor网络（输出连续动作分布）
+        # Initialize the actor network (outputs a continuous action distribution)
         self._init_actor(continuous_action_dim)
 
     def get_optim_params(self) -> dict:
-        """获取各模块的可优化参数，用于构建优化器"""
+        """Collect the trainable parameters of each module, used to build the optimizers."""
         optim_params = {
             "actor": [
                 p
                 for n, p in self.actor.named_parameters()
-                # 若共享编码器，Actor不优化编码器参数（避免梯度冲突）
+                # With a shared encoder the actor does not optimize the encoder parameters (avoids gradient conflicts)
                 if not n.startswith("encoder") or not self.shared_encoder
             ],
             "critic": self.critic_ensemble.parameters(),
@@ -86,6 +86,15 @@ class SiLRIDualArmPolicy(
             "lagrange": self.lagrange_net.parameters(),
         }
         return optim_params
+    
+    def get_optimizer_and_scheduler(self):
+        optim_dict = {
+            "actor": torch.optim.Adam(params=self.actor.parameters()+list(self.discrete_actor.parameters()), lr=self.config.actor_lr),
+            "critic": torch.optim.Adam(self.critic_ensemble.parameters(), lr=self.config.critic_lr),
+            "expert": torch.optim.Adam(self.expert_network.parameters(), lr=self.config.actor_lr),
+            "lagrange": torch.optim.Adam(self.lagrange_net.parameters(), lr=0.01 * self.config.critic_lr),
+        }
+        return optim_dict, None
 
     def reset(self):
         """Reset the policy"""
@@ -109,18 +118,18 @@ class SiLRIDualArmPolicy(
         """
         observations_features = None
         
-        # 若共享编码器且含图像，缓存图像特征（避免重复编码，提升速度）
+        # With a shared encoder and image inputs, cache the image features (avoids re-encoding, faster)
         if self.shared_encoder and self.actor.encoder.has_images:
             # Cache and normalize image features
 
             observations_features = self.actor.encoder.get_cached_image_features(batch, normalize=True)
-        # actor网络生成当前观测对应的基础动作
+        # The actor produces the base action for the current observation
         actions, *_ = self.actor(batch, observations_features)
 
         epsilon = 1e-6
         actions = torch.clamp(actions, -1+epsilon, 1-epsilon)
 
-        # 若有离散动作，离散Critic输出各动作价值，选价值最大的动作
+        # With discrete actions, the discrete critic scores each action and the argmax is taken
         # todo11
         if self.config.num_discrete_actions is not None:
             # discrete_action_value = self.discrete_critic(batch, observations_features)
@@ -431,9 +440,9 @@ class SiLRIDualArmPolicy(
         actions_discrete = actions_discrete.long()
         
         # actions_discrete: (N, 2: left,right)
-        actions_discrete = actions_discrete.squeeze(-1)  # batch_size,) 1维张量
+        actions_discrete = actions_discrete.squeeze(-1)  # (batch_size,) 1-D tensor
        
-        # 当前预测的夹爪动作: (N, 2: left, right, 2: open_logits, close_logits)
+        # Predicted gripper action: (N, 2: left/right, 2: open_logits/close_logits)
         actions_pi = self.discrete_actor(observations, observation_features)
 
         print_action_pi = torch.argmax(actions_pi, dim=-1, keepdim=True)
@@ -446,7 +455,7 @@ class SiLRIDualArmPolicy(
         # print_green(f"compute_loss_discrete_actor-actions_discrete: {actions_discrete}")
 
         """
-        change: 只计算intervention为1的损失
+        change: only compute the loss on samples where intervention == 1
         """        
         mask = is_intervention == 1
         actions_pi = actions_pi[mask]

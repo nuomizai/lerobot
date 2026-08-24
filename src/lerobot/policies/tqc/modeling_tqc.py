@@ -20,7 +20,6 @@ from collections.abc import Callable
 from dataclasses import asdict
 from typing import Literal
 
-import einops
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,21 +30,21 @@ import os
 import cv2
 from lerobot.policies.normalize import NormalizeBuffer
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.sac.configuration_sac import SACConfig, is_image_feature
+from lerobot.policies.tqc.configuration_tqc import TQCConfig, is_image_feature
 from lerobot.policies.utils import get_device_from_parameters
 
 DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 
 
-class SACPolicy(
+class TQCPolicy(
     PreTrainedPolicy,
 ):
-    config_class = SACConfig
-    name = "sac"
+    config_class = TQCConfig
+    name = "tqc"
 
     def __init__(
         self,
-        config: SACConfig | None = None,
+        config: TQCConfig | None = None,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
         super().__init__(config)
@@ -53,6 +52,9 @@ class SACPolicy(
         self.config = config
 
         dataset_stats=self.config.dataset_stats
+
+        # Debug / analysis counters (avoid relying on external trainer global_step).
+        self._critic_quantiles_dump_idx: int = 0
 
         # Determine action dimension and initialize all components
         continuous_action_dim = config.output_features["action"].shape[0]
@@ -82,11 +84,11 @@ class SACPolicy(
         if self.config.num_discrete_actions is not None:
             optim_params["discrete_critic"] = self.discrete_critic.parameters()
         return optim_params
-    
+
     def get_optimizer_and_scheduler(self):
         optim_dict = {
             "actor": torch.optim.Adam(self.actor.parameters(), lr=self.config.actor_lr),
-            "critic": torch.optim.Adam(self.critic_ensemble.parameters(), lr=self.config.critic_lr),
+            "critic": torch.optim.Adam(list(self.critic_ensemble.parameters()), lr=self.config.critic_lr),
             "temperature": torch.optim.Adam([self.log_alpha], lr=self.config.temperature_lr),
         }
         if self.config.num_discrete_actions is not None:
@@ -113,7 +115,6 @@ class SACPolicy(
             The final action tensor (continuous action concatenated with the optional discrete action)
         """
         observations_features = None
-
         
         # With a shared encoder and image inputs, cache the image features (avoids re-encoding, faster)
         if self.shared_encoder and self.actor.encoder.has_images:
@@ -131,22 +132,33 @@ class SACPolicy(
             actions = torch.cat([actions, discrete_action], dim=-1)
         return actions, {}
 
+
     @torch.no_grad()
     def eval_action(self, batch: dict[str, Tensor]) -> Tensor:
+        """Select action for inference/evaluation"""
+        """
+        Select an action during evaluation.
+        Args:
+            batch: observation dict (images (left, wrist) and state)
+        Returns:
+            The final action tensor (continuous action concatenated with the optional discrete action)
+        """
         observations_features = None
         
         # With a shared encoder and image inputs, cache the image features (avoids re-encoding, faster)
         if self.shared_encoder and self.actor.encoder.has_images:
+            # Cache and normalize image features
+
             observations_features = self.actor.encoder.get_cached_image_features(batch, normalize=True)
         _, _, actions = self.actor(batch, observations_features)
-        ##### fix #######
-        actions = torch.tanh(actions)
+
+
         # With discrete actions, the discrete critic scores each action and the argmax is taken
         if self.config.num_discrete_actions is not None:
             discrete_action_value = self.discrete_critic(batch, observations_features)
             discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+
             actions = torch.cat([actions, discrete_action], dim=-1)
-        
         return actions, {}
         
     def critic_forward(
@@ -164,7 +176,7 @@ class SACPolicy(
             use_target: If True, use target critics, otherwise use ensemble critics
 
         Returns:
-            Tensor of Q-values from all critics
+            Tensor of shape (num_critics, batch, n_quantiles) with predicted quantiles per critic.
         """
 
         critics = self.critic_target if use_target else self.critic_ensemble
@@ -216,8 +228,11 @@ class SACPolicy(
 
         if model == "critic":
             # Extract critic-specific components
-            rewards: Tensor = batch["reward"]
             next_observations: dict[str, Tensor] = batch["next_state"]
+            rewards1: Tensor = batch["reward"]
+            rewards2: Tensor = batch["complementary_info"]["first_intervene_reward"]
+            # rewards = rewards2
+            rewards = rewards1 + rewards2
             done: Tensor = batch["done"]
             next_observation_features: Tensor = batch.get("next_observation_feature")
 
@@ -235,7 +250,10 @@ class SACPolicy(
 
         if model == "discrete_critic" and self.config.num_discrete_actions is not None:
             # Extract critic-specific components
-            rewards: Tensor = batch["reward"]
+            rewards1: Tensor = batch["reward"]
+            rewards2: Tensor = batch["complementary_info"]["first_intervene_reward"]
+            # rewards = rewards2
+            rewards = rewards1 + rewards2
             next_observations: dict[str, Tensor] = batch["next_state"]
             done: Tensor = batch["done"]
             next_observation_features: Tensor = batch.get("next_observation_feature")
@@ -252,11 +270,11 @@ class SACPolicy(
             )
             return {"loss_discrete_critic": loss_discrete_critic}
         if model == "actor":
-            loss_actor = self.compute_loss_actor(
+            loss_actor_dict = self.compute_loss_actor(
                     observations=observations,
                     observation_features=observation_features,
                 )
-            return loss_actor
+            return loss_actor_dict
 
         if model == "temperature":
             return {
@@ -267,6 +285,73 @@ class SACPolicy(
             }
 
         raise ValueError(f"Unknown model type: {model}")
+
+    def draw_critic_qc(self, action: np.ndarray, device: torch.device, policy_obs: dict[str, Tensor]) -> None:
+        """Visualize critic_qc quantile distribution as an on-screen bar chart.
+        Bar colors map to Q values via a colormap (blue=low, red=high).
+
+        Args:
+            critic_qc: numpy array of shape (batch, n_quantiles) or (n_quantiles,).
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+        import cv2
+
+        with torch.no_grad():
+            action_tensor = torch.from_numpy(action).float().unsqueeze(0).to(device)
+            action_tensor = action_tensor[:, :self.continuous_action_dim]
+            critic_qc = self.critic_forward(policy_obs, action_tensor, use_target=False, observation_features=None)
+            critic_qc = critic_qc.min(dim=0)[0].cpu().numpy()
+
+        VMIN, VMAX = -1.0, 5.0
+
+        qc = critic_qc.flatten()
+        qc_clipped = np.clip(qc, VMIN, VMAX)
+        n_q = len(qc_clipped)
+        tau = np.linspace(0.5 / n_q, 1.0 - 0.5 / n_q, n_q)
+
+        norm = mcolors.Normalize(vmin=VMIN, vmax=VMAX)
+        cmap = cm.get_cmap("coolwarm")
+        colors = [cmap(norm(v)) for v in qc_clipped]
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        fig.patch.set_facecolor("#1e1e1e")
+        ax.set_facecolor("#2d2d2d")
+        ax.tick_params(colors="white")
+        ax.xaxis.label.set_color("white")
+        ax.yaxis.label.set_color("white")
+        ax.title.set_color("white")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#555555")
+
+        ax.bar(tau, qc_clipped, width=0.9 / n_q, color=colors, alpha=0.9)
+        ax.set_ylim(VMIN, VMAX)
+        mean_val = float(np.mean(qc_clipped))
+        ax.axhline(mean_val, color="yellow", linestyle="--", linewidth=1.2,
+                   label=f"mean = {mean_val:.4f}  (raw mean = {float(np.mean(qc)):.4f})")
+        ax.set_xlabel("Quantile level τ")
+        ax.set_ylabel("Q value")
+        ax.set_title("critic_q — current state")
+        ax.legend(facecolor="#3d3d3d", labelcolor="white", framealpha=0.8)
+
+        sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+        cbar.ax.yaxis.set_tick_params(color="white")
+        plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
+
+        plt.tight_layout(pad=1.5)
+
+        fig.canvas.draw()
+        buf = fig.canvas.buffer_rgba()
+        img = np.asarray(buf)[:, :, :3]
+        plt.close(fig)
+
+        cv2.imshow("critic_q", img[:, :, ::-1])
+        cv2.waitKey(1)
 
     def update_target_networks(self):
         """Update target networks with exponential moving average"""
@@ -293,6 +378,32 @@ class SACPolicy(
     def update_temperature(self):
         self.temperature = self.log_alpha.exp().item()
 
+    def _quantile_huber_loss_tqc(self, quantiles: Tensor, target_atoms: Tensor) -> Tensor:
+        """Quantile Huber loss matching the reference TQC implementation (BayesGroup).
+
+        Args:
+            quantiles: (batch, num_critics, n_quantiles) online predictions.
+            target_atoms: (batch, num_target_atoms) Bellman target samples (truncated mixture).
+
+        Returns:
+            Scalar loss (mean over batch, critics, quantiles, and target atoms).
+        """
+        # pairwise_delta: batch x nets x quantiles x samples
+        pairwise_delta = target_atoms[:, None, None, :] - quantiles[:, :, :, None]
+        abs_pairwise_delta = torch.abs(pairwise_delta)
+        huber_loss = torch.where(
+            abs_pairwise_delta > 1.0,
+            abs_pairwise_delta - 0.5,
+            pairwise_delta**2 * 0.5,
+        )
+        n_quantiles = quantiles.shape[2]
+        tau = (
+            torch.arange(n_quantiles, device=quantiles.device, dtype=quantiles.dtype) / n_quantiles
+            + 0.5 / n_quantiles
+        )
+        loss = (torch.abs(tau[None, None, :, None] - (pairwise_delta < 0.0).float()) * huber_loss).mean()
+        return loss
+
     def compute_loss_critic(
         self,
         observations,
@@ -306,7 +417,6 @@ class SACPolicy(
         with torch.no_grad():
             next_action_preds, next_log_probs, _ = self.actor(next_observations, next_observation_features)
 
-            # 2- compute q targets
             q_targets = self.critic_forward(
                 observations=next_observations,
                 actions=next_action_preds,
@@ -314,22 +424,22 @@ class SACPolicy(
                 observation_features=next_observation_features,
             )
 
-            # subsample critics to prevent overfitting if use high UTD (update to date)
-            # TODO: Get indices before forward pass to avoid unnecessary computation
-            if self.config.num_subsample_critics is not None:
-                indices = torch.randperm(self.config.num_critics)
-                indices = indices[: self.config.num_subsample_critics]
-                q_targets = q_targets[indices]
+            num_critics_used, batch_size, n_quantiles = q_targets.shape
+            next_z = q_targets.permute(1, 0, 2).reshape(batch_size, num_critics_used * n_quantiles)
+            sorted_z, _ = torch.sort(next_z, dim=-1)
+            top_drop = self.config.tqc_top_quantiles_to_drop_per_net * num_critics_used
+            n_atoms = sorted_z.shape[-1] - top_drop
+            sorted_z_part = sorted_z[:, :n_atoms]
 
-            # critics subsample size
-            min_q, _ = q_targets.min(dim=0)  # Get values from min operation
-            if self.config.use_backup_entropy:
-                min_q = min_q - (self.temperature * next_log_probs)
+            # if self.config.use_backup_entropy:
+            #     sorted_z_part = sorted_z_part - (self.temperature * next_log_probs).unsqueeze(-1)
 
-            td_target = rewards + (1 - done) * self.config.discount * min_q
+            rewards_b = rewards.reshape(batch_size, -1)
+            done_b = done.to(dtype=sorted_z_part.dtype).reshape(batch_size, -1)
+            # done_b = done.reshape(batch_size, -1)
+            td_atoms = rewards_b + (1.0 - done_b) * self.config.discount * sorted_z_part
 
-        # 3- compute predicted qs
-        actions: Tensor = actions[:, : self.continuous_action_dim]
+        actions = actions[:, : self.continuous_action_dim]
         q_preds = self.critic_forward(
             observations=observations,
             actions=actions,
@@ -337,18 +447,45 @@ class SACPolicy(
             observation_features=observation_features,
         )
 
-        # 4- Calculate loss
-        # Compute state-action value loss (TD loss) for all of the Q functions in the ensemble.
-        td_target_duplicate = einops.repeat(td_target, "b -> e b", e=q_preds.shape[0])
-        # You compute the mean loss of the batch for each critic and then to compute the final loss you sum them up
-        critics_loss = (
-            F.mse_loss(
-                input=q_preds,
-                target=td_target_duplicate,
-                reduction="none",
-            ).mean(dim=1)
-        ).sum()
-        return critics_loss
+        # Dump per-critic quantiles to .npy for analysis.
+        # q_preds shape: (num_critics, batch, n_quantiles)
+        if self.config.dump_critic_quantiles_npy:
+            dump_idx = int(self._critic_quantiles_dump_idx)
+            if dump_idx % int(self.config.dump_critic_quantiles_every) == 0:
+                try:
+                    dump_dir = self.config.dump_critic_quantiles_dir
+                    os.makedirs(dump_dir, exist_ok=True)
+
+                    # q_cpu = q_preds.detach().to("cpu")
+                    # q_mean_cpu = q_cpu.mean(dim=1)  # (num_critics, n_quantiles)
+
+                    # np.save(os.path.join(dump_dir, f"q_preds_quantiles_{dump_idx:012d}.npy"), q_cpu.numpy())
+                    # np.save(
+                    #     os.path.join(dump_dir, f"q_preds_quantiles_meanB_{dump_idx:012d}.npy"),
+                    #     q_mean_cpu.numpy(),
+                    # )
+
+                    # Also dump sorted target atoms after TQC truncation (and optional entropy backup).
+                    # sorted_z_part shape: (B, n_atoms)
+                    sorted_cpu = sorted_z_part.detach().to("cpu")
+                    np.save(
+                        os.path.join(dump_dir, f"sorted_z_part_{dump_idx:012d}.npy"),
+                        sorted_cpu.numpy(),
+                    )
+                    if self.config.dump_critic_quantiles_max_files is not None:
+                        max_files = int(self.config.dump_critic_quantiles_max_files)
+                        # Each dump writes 2 files; keep at most max_files dumps (best effort).
+                        if max_files > 0 and dump_idx // int(self.config.dump_critic_quantiles_every) >= max_files:
+                            self.config.dump_critic_quantiles_npy = False
+                except Exception:
+                    # Best-effort debug utility; never break training due to I/O issues.
+                    pass
+            self._critic_quantiles_dump_idx += 1
+
+        # (num_critics, batch, n_quantiles) -> (batch, num_critics, n_quantiles)
+        q_perm = q_preds.permute(1, 0, 2).contiguous()
+        critic_loss = self._quantile_huber_loss_tqc(q_perm, td_atoms)
+        return critic_loss
 
     def compute_loss_discrete_critic(
         self,
@@ -367,7 +504,6 @@ class SACPolicy(
         actions_discrete: Tensor = actions[:, DISCRETE_DIMENSION_INDEX:].clone()
         actions_discrete = torch.round(actions_discrete)
         actions_discrete = actions_discrete.long()
-
         discrete_penalties: Tensor | None = None
 
         if complementary_info is not None:
@@ -398,7 +534,6 @@ class SACPolicy(
 
             # Compute target Q-value with Bellman equation
             rewards_discrete = rewards
-
             if discrete_penalties is not None:
                 rewards_discrete = rewards + discrete_penalties
 
@@ -438,10 +573,30 @@ class SACPolicy(
             use_target=False,
             observation_features=observation_features,
         )
-        min_q_preds = q_preds.min(dim=0)[0]
+        # # qc_preds: [n_qc_critics, B, n_quantiles] -> [B, n_quantiles]
+        # q_preds_bcq = q_preds.mean(0)
+        # N = q_preds_bcq.shape[-1]
 
-        actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
-        return {"loss_actor": actor_loss, "min_q_preds": min_q_preds.mean().detach().item()}
+        # q_for_actor = q_preds.permute(1, 0, 2).mean(dim=-1).mean(dim=-1)
+        # k = max(1, int((1 - self.config.quantile_level) * N))
+        # q_for_actor = q_preds_bcq[..., -k:].mean(dim=-1)
+
+        # actor_loss = ((self.temperature * log_probs) - q_for_actor).mean()
+        
+        q_for_actor = q_preds.min(dim=0)[0].mean()
+        actor_loss = (- q_for_actor).mean()
+        # actor_loss = ((self.temperature * log_probs) - q_for_actor).mean()
+
+        loss_from_q = (- q_for_actor)
+        # loss_from_q = (- q_for_actor).mean()
+        loss_from_entropy = (self.temperature * log_probs).mean()
+
+        return {
+            "loss_actor":    actor_loss,    # tensor, left for the caller to backward
+            "loss_from_q":   loss_from_q,   # tensor, left for the caller to compute gradients
+            "loss_from_entropy":  loss_from_entropy,  # tensor, left for the caller to compute gradients
+            "min_q_preds":   q_for_actor.mean().detach().item(),
+        }
 
     def _init_normalization(self, dataset_stats):
         """Initialize input/output normalization modules."""
@@ -458,40 +613,57 @@ class SACPolicy(
             )
 
     def _init_encoders(self):
-        """Initialize shared or separate encoders for actor and critic."""
+        """Initialize encoders in the same style as RiseSingleDonePolicy.
+
+        We keep the `shared_encoder` flag (used for actor-side detach / caching),
+        but we instantiate separate encoder modules for:
+        - continuous critic (online + target)
+        - actor
+        - optional discrete critic (online + target)
+        """
         self.shared_encoder = self.config.shared_encoder
+
+        # Continuous-action critic encoders (online + target)
         self.encoder_critic = SACObservationEncoder(self.config, self.normalize_inputs)
-        self.encoder_actor = (
-            self.encoder_critic
-            if self.shared_encoder
-            else SACObservationEncoder(self.config, self.normalize_inputs)
-        )
+        self.encoder_critic_target = SACObservationEncoder(self.config, self.normalize_inputs)
+
+        # Actor encoder
+        self.encoder_actor = SACObservationEncoder(self.config, self.normalize_inputs)
+
+        # Optional discrete-action critic encoders (online + target)
+        if self.config.num_discrete_actions is not None:
+            self.discrete_encoder = SACObservationEncoder(self.config, self.normalize_inputs)
+            self.discrete_encoder_target = SACObservationEncoder(self.config, self.normalize_inputs)
 
     def _init_critics(self, continuous_action_dim):
-        """Build critic ensemble, targets, and optional discrete critic."""
+        """Build TQC distributional critic ensemble (quantile outputs per head), targets, optional discrete critic."""
+        n_q = self.config.tqc_n_quantiles
         heads = [
-            CriticHead(
+            QuantileCriticHead(
                 input_dim=self.encoder_critic.output_dim + continuous_action_dim,
+                n_quantiles=n_q,
                 **asdict(self.config.critic_network_kwargs),
             )
             for _ in range(self.config.num_critics)
         ]
-        self.critic_ensemble = CriticEnsemble(
+        self.critic_ensemble = QuantileCriticEnsemble(
             encoder=self.encoder_critic, ensemble=heads, output_normalization=self.normalize_targets
         )
         target_heads = [
-            CriticHead(
-                input_dim=self.encoder_critic.output_dim + continuous_action_dim,
+            QuantileCriticHead(
+                input_dim=self.encoder_critic_target.output_dim + continuous_action_dim,
+                n_quantiles=n_q,
                 **asdict(self.config.critic_network_kwargs),
             )
             for _ in range(self.config.num_critics)
         ]
-        self.critic_target = CriticEnsemble(
-            encoder=self.encoder_critic, ensemble=target_heads, output_normalization=self.normalize_targets
+        self.critic_target = QuantileCriticEnsemble(
+            encoder=self.encoder_critic_target, ensemble=target_heads, output_normalization=self.normalize_targets
         )
         self.critic_target.load_state_dict(self.critic_ensemble.state_dict())
 
         if self.config.use_torch_compile:
+            torch._functorch.config.donated_buffer = False
             self.critic_ensemble = torch.compile(self.critic_ensemble)
             self.critic_target = torch.compile(self.critic_target)
 
@@ -501,14 +673,14 @@ class SACPolicy(
     def _init_discrete_critics(self):
         """Build discrete discrete critic ensemble and target networks."""
         self.discrete_critic = DiscreteCritic(
-            encoder=self.encoder_critic,
-            input_dim=self.encoder_critic.output_dim,
+            encoder=self.discrete_encoder,
+            input_dim=self.discrete_encoder.output_dim,
             output_dim=self.config.num_discrete_actions,
             **asdict(self.config.discrete_critic_network_kwargs),
         )
         self.discrete_critic_target = DiscreteCritic(
-            encoder=self.encoder_critic,
-            input_dim=self.encoder_critic.output_dim,
+            encoder=self.discrete_encoder_target,
+            input_dim=self.discrete_encoder_target.output_dim,
             output_dim=self.config.num_discrete_actions,
             **asdict(self.config.discrete_critic_network_kwargs),
         )
@@ -542,7 +714,7 @@ class SACPolicy(
 class SACObservationEncoder(nn.Module):
     """Encode image and/or state vector observations."""
 
-    def __init__(self, config: SACConfig, input_normalizer: nn.Module) -> None:
+    def __init__(self, config: TQCConfig, input_normalizer: nn.Module) -> None:
         super().__init__()
         self.config = config
         self.input_normalization = input_normalizer
@@ -777,10 +949,13 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class CriticHead(nn.Module):
+class QuantileCriticHead(nn.Module):
+    """Critic head outputting N quantiles (TQC / QR-DQN style)."""
+
     def __init__(
         self,
         input_dim: int,
+        n_quantiles: int,
         hidden_dims: list[int],
         activations: Callable[[torch.Tensor], torch.Tensor] | str = nn.SiLU(),
         activate_final: bool = False,
@@ -789,6 +964,7 @@ class CriticHead(nn.Module):
         final_activation: Callable[[torch.Tensor], torch.Tensor] | str | None = None,
     ):
         super().__init__()
+        self.n_quantiles = int(n_quantiles)
         self.net = MLP(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
@@ -797,7 +973,7 @@ class CriticHead(nn.Module):
             dropout_rate=dropout_rate,
             final_activation=final_activation,
         )
-        self.output_layer = nn.Linear(in_features=hidden_dims[-1], out_features=1)
+        self.output_layer = nn.Linear(in_features=hidden_dims[-1], out_features=self.n_quantiles)
         if init_final is not None:
             nn.init.uniform_(self.output_layer.weight, -init_final, init_final)
             nn.init.uniform_(self.output_layer.bias, -init_final, init_final)
@@ -812,21 +988,21 @@ class CriticHead(nn.Module):
 
 class CriticEnsemble(nn.Module):
     """
-    CriticEnsemble wraps multiple CriticHead modules into an ensemble.
+    CriticEnsemble wraps multiple QuantileCriticHead modules into an ensemble.
 
     Args:
         encoder (SACObservationEncoder): encoder for observations.
-        ensemble (List[CriticHead]): list of critic heads.
+        ensemble (List[QuantileCriticHead]): list of critic heads.
         output_normalization (nn.Module): normalization layer for actions.
         init_final (float | None): optional initializer scale for final layers.
 
-    Forward returns a tensor of shape (num_critics, batch_size) containing Q-values.
+    Forward returns a tensor of shape (num_critics, batch_size, n_quantiles).
     """
 
     def __init__(
         self,
         encoder: SACObservationEncoder,
-        ensemble: list[CriticHead],
+        ensemble: list[QuantileCriticHead],
         output_normalization: nn.Module,
         init_final: float | None = None,
     ):
@@ -859,16 +1035,46 @@ class CriticEnsemble(nn.Module):
 
         inputs = torch.cat([obs_enc, actions], dim=-1)
 
-        # Loop through critics and collect outputs
         q_values = []
         for critic in self.critics:
             q_values.append(critic(inputs))
 
-        # Stack outputs to match expected shape [num_critics, batch_size]
-        q_values = torch.stack([q.squeeze(-1) for q in q_values], dim=0)
+        return torch.stack(q_values, dim=0)
 
-        return q_values
+class QuantileCriticEnsemble(nn.Module):
+    """Ensemble of quantile critics. Forward returns (num_critics, batch, n_quantiles)."""
 
+    def __init__(
+        self,
+        encoder: SACObservationEncoder,
+        ensemble: list[QuantileCriticHead],
+        output_normalization: nn.Module,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.output_normalization = output_normalization
+        self.critics = nn.ModuleList(ensemble)
+
+    def forward(
+        self,
+        observations: dict[str, torch.Tensor],
+        actions: torch.Tensor,
+        observation_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        device = get_device_from_parameters(self)
+        observations = {k: v.to(device) for k, v in observations.items()}
+
+        actions_dict: dict[str, torch.Tensor] = {"action": actions}
+        actions_dict = self.output_normalization(actions_dict)
+        actions_normed = actions_dict["action"].to(device)
+
+        obs_enc = self.encoder(observations, cache=observation_features)
+        inputs = torch.cat([obs_enc, actions_normed], dim=-1)
+
+        q_values = []
+        for critic in self.critics:
+            q_values.append(critic(inputs))
+        return torch.stack(q_values, dim=0)
 
 class DiscreteCritic(nn.Module):
     def __init__(
@@ -972,8 +1178,8 @@ class Policy(nn.Module):
         # Compute standard deviations
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
+            log_std = torch.clamp(log_std, self.std_min, self.std_max)  # Match JAX default clip
             std = torch.exp(log_std)  # Match JAX "exp"
-            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
         else:
             std = self.fixed_std.expand_as(means)
 
@@ -999,7 +1205,7 @@ class Policy(nn.Module):
 
 
 class DefaultImageEncoder(nn.Module):
-    def __init__(self, config: SACConfig):
+    def __init__(self, config: TQCConfig):
         super().__init__()
         image_key = next(key for key in config.input_features if is_image_feature(key))
         self.image_enc_layers = nn.Sequential(
@@ -1045,21 +1251,20 @@ def freeze_image_encoder(image_encoder: nn.Module):
 
 
 class PretrainedImageEncoder(nn.Module):
-    def __init__(self, config: SACConfig):
+    def __init__(self, config: TQCConfig):
         super().__init__()
 
         self.image_enc_layers, self.image_enc_out_shape = self._load_pretrained_vision_encoder(config)
 
-    def _load_pretrained_vision_encoder(self, config: SACConfig):
+    def _load_pretrained_vision_encoder(self, config: TQCConfig):
         """Set up CNN encoder"""
         from transformers import AutoModel
-        
+
         self.image_enc_layers = AutoModel.from_pretrained(
             config.vision_encoder_name,
             trust_remote_code=True,
             revision="c587b31f2f79e653249ed4af78f0ba7dff72122c",
         )
-        # self.image_enc_layers = AutoModel.from_pretrained(config.vision_encoder_name, trust_remote_code=True)
 
         if hasattr(self.image_enc_layers.config, "hidden_sizes"):
             self.image_enc_out_shape = self.image_enc_layers.config.hidden_sizes[-1]  # Last channel dimension

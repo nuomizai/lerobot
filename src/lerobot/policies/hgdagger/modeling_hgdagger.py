@@ -33,7 +33,6 @@ from lerobot.policies.normalize import NormalizeBuffer
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters
 from lerobot.policies.sac.modeling_sac import SACObservationEncoder, CriticHead, CriticEnsemble, DiscreteCritic, MLP
-from lerobot.policies.awac.modeling_awac import Policy as TanhPolicy
 from lerobot.policies.hgdagger.configuration_hgdagger import HGDaggerConfig
 
 
@@ -59,21 +58,32 @@ class HGDaggerPolicy(
         self.continuous_action_dim = continuous_action_dim
 
         self._init_normalization(dataset_stats)
-        # 初始化观测编码器（Actor与Critic可共享或独立）
+        # Initialize the observation encoder (shared between actor and critic, or separate)
         self._init_encoders()  
         self._init_actor(continuous_action_dim)
 
     def get_optim_params(self) -> dict:
-        """获取各模块的可优化参数，用于构建优化器"""
+        """Collect the trainable parameters of each module, used to build the optimizers."""
         optim_params = {
             "actor": [
                 p
                 for n, p in self.actor.named_parameters()
-                # 若共享编码器，Actor不优化编码器参数（避免梯度冲突）
+                # With a shared encoder the actor does not optimize the encoder parameters (avoids gradient conflicts)
                 if not n.startswith("encoder") or not self.shared_encoder
             ],
         }
         return optim_params
+
+    def get_optimizer_and_scheduler(self):
+        if self.config.num_discrete_actions is not None:
+            optim_dict = {
+                "actor": torch.optim.Adam(list(self.actor.parameters()) + list(self.discrete_actor.parameters()), lr=self.config.actor_lr),
+            }
+        else:
+            optim_dict = {
+                "actor": torch.optim.Adam(self.actor.parameters(), lr=self.config.actor_lr),
+            }
+        return optim_dict, None
 
     def reset(self):
         """Reset the policy"""
@@ -89,27 +99,27 @@ class HGDaggerPolicy(
     def select_action(self, batch: dict[str, Tensor], policy_noise=None) -> Tensor:
         """Select action for inference/evaluation"""
         """
-        推理/评估阶段选择动作
+        Select an action during inference / evaluation.
         Args:
-            batch: 观测字典（含图像（left、wrist）、状态）
+            batch: observation dict (images (left, wrist) and state)
         Returns:
-            最终动作张量（连续动作 + 可选离散动作拼接）
+            The final action tensor (continuous action concatenated with the optional discrete action)
         """
         observations_features = None
         
-        # 若共享编码器且含图像，缓存图像特征（避免重复编码，提升速度）
+        # With a shared encoder and image inputs, cache the image features (avoids re-encoding, faster)
         if self.shared_encoder and self.actor.encoder.has_images:
             # Cache and normalize image features
 
             observations_features = self.actor.encoder.get_cached_image_features(batch, normalize=True)
-        # actor网络生成当前观测对应的基础动作
+        # The actor produces the base action for the current observation
         actions, *_ = self.actor(batch, observations_features)
 
 
         epsilon = 1e-6
         actions = torch.clamp(actions, -1+epsilon, 1-epsilon)
 
-        # 若有离散动作，离散Critic输出各动作价值，选价值最大的动作
+        # With discrete actions, the discrete critic scores each action and the argmax is taken
         # todo11
         if self.config.num_discrete_actions is not None:
             # discrete_action_value = self.discrete_critic(batch, observations_features)
@@ -225,14 +235,14 @@ class HGDaggerPolicy(
         # In the buffer we have the full action space (continuous + discrete)
         # We need to split them before concatenating them in the critic forward
         # ============= todo: add bc loss to discrete critic =============
-        # 提取真实的离散动作部分并转换为整数标签
+        # Extract the ground-truth discrete action and turn it into an integer label
         actions_discrete: Tensor = old_actions[:, self.continuous_action_dim:].clone()
-        # 四舍五入为整数离散值
+        # Round to the nearest integer discrete value
         actions_discrete = torch.round(actions_discrete)
         actions_discrete = actions_discrete.long()
-        actions_discrete = actions_discrete.squeeze(-1)  # batch_size,) 1维张量
+        actions_discrete = actions_discrete.squeeze(-1)  # (batch_size,) 1-D tensor
         # print('actions_discrete:', actions_discrete.shape) (256)
-        # 当前预测的夹爪动作
+        # Predicted gripper action
         actions_pi = self.discrete_actor(observations, observation_features)
         # print('actions_pi:', actions_pi.shape) (256, 2)
         discrete_loss = F.nll_loss(actions_pi, actions_discrete, reduction="none")
@@ -243,10 +253,10 @@ class HGDaggerPolicy(
          
  
     """
-    hg_dagger属于模仿学习，actor loss即bc loss
-    随机性策略不再采用mse loss
+    hg_dagger is imitation learning, so the actor loss is the BC loss.
+    A stochastic policy no longer uses an MSE loss.
     """
-    # todo2:去掉夹爪action loss的计算
+    # todo2: drop the gripper action loss
     def compute_loss_actor(
         self,
         observations,
@@ -263,7 +273,6 @@ class HGDaggerPolicy(
         actor_loss = bc_loss
         return {
             "loss_actor": actor_loss,
-            "bc_loss": bc_loss,
         }
     
 
@@ -323,7 +332,7 @@ class HGDaggerPolicy(
             self._init_discrete_critics()
 
 
-    # todo3:初始化discrete_actor
+    # todo3: initialize discrete_actor
     def _init_discrete_actor(self):
         """Build discrete discrete critic ensemble and target networks."""
         self.discrete_actor = DiscreteCritic(
@@ -422,23 +431,23 @@ class Policy(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
-        # 通过编码器（如神经网络）处理，提取有用特征
+        # Run the observation through the encoder to extract features
         # print("observations.observation.images.right:", observations.observation.images.right.shape)
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
 
         # Get network outputs
-        # 网络输出与均值计算
+        # Network output and mean
         outputs = self.network(obs_enc)
 
         means = self.mean_layer(outputs)
 
         """
-        means经过tanh放缩
+        means are squashed with tanh
         """
         means = torch.tanh(means)
 
         # Compute standard deviations
-        # 标准差计算
+        # Standard deviation
 
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
@@ -452,32 +461,32 @@ class Policy(nn.Module):
         
 
         # Build transformed distribution
-        # 构建一个对角线协方差的多元正态分布
+        # Build a multivariate normal with diagonal covariance
         # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
 
         """
-        采用多元正态分布
+        Uses a multivariate normal distribution
         """
         dist = MultivariateNormalDiag(loc=means, scale_diag=std)
 
         # Sample actions (reparameterized)
-        # 动作采样
+        # Sample actions
         if n == 1:
             actions = dist.rsample()
             """
-            裁剪动作
+            Clip the actions
             """
             log_probs = dist.log_prob(actions) # torch.Size([batch_size, action_dim])
         else:
             """
-            采样多个样本
+            Draw multiple samples
             """
             actions = dist.rsample(sample_shape=(n,)) # torch.Size([n, batch_size, action_dim])
             # reshape -> [B, action_dim]
             # actions=actions.reshape(-1, actions.shape[-1])
-            # print("调整后actions尺寸: ", actions.shape)
+            # print("actions shape after reshaping: ", actions.shape)
 
-            # 为每个样本计算对数概率
+            # Compute the log-probability of each sample
             log_probs = torch.stack([dist.log_prob(actions[i]) for i in range(n)])
             log_probs = dist.log_prob(actions) # torch.Size([n*batch_size, action_dim])
             
@@ -495,22 +504,22 @@ class Policy(nn.Module):
     ):
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
-        # 通过编码器（如神经网络）处理，提取有用特征
+        # Run the observation through the encoder to extract features
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
       
         # Get network outputs
-        # 网络输出与均值计算
+        # Network output and mean
         outputs = self.network(obs_enc)
       
         means = self.mean_layer(outputs)
 
         """
-        means经过tanh放缩
+        means are squashed with tanh
         """
         means = torch.tanh(means)
 
         # Compute standard deviations
-        # 标准差计算
+        # Standard deviation
     
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
@@ -520,17 +529,17 @@ class Policy(nn.Module):
             std = self.fixed_std.expand_as(means)
 
         # Build transformed distribution
-        # 构建一个对角线协方差的多元正态分布
+        # Build a multivariate normal with diagonal covariance
         # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
         """
-        采用多元正态分布
+        Uses a multivariate normal distribution
         """
         dist = MultivariateNormalDiag(loc=means, scale_diag=std)
 
         return dist, means, std
 
     """
-    add 2:计算给定状态和动作下的对数概率
+    add 2: compute the log-probability of the given state-action pair
     """
     def get_log_probs(
         self,
@@ -540,22 +549,22 @@ class Policy(nn.Module):
     ) -> torch.Tensor:
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
-        # 通过编码器（如神经网络）处理，提取有用特征
+        # Run the observation through the encoder to extract features
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
       
         # Get network outputs
-        # 网络输出与均值计算
+        # Network output and mean
         outputs = self.network(obs_enc)
       
         means = self.mean_layer(outputs)
 
         """
-        means经过tanh放缩
+        means are squashed with tanh
         """
         means = torch.tanh(means)
 
         # Compute standard deviations
-        # 标准差计算
+        # Standard deviation
     
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
@@ -565,28 +574,28 @@ class Policy(nn.Module):
             std = self.fixed_std.expand_as(means)
 
         # Build transformed distribution
-        # 构建一个对角线协方差的多元正态分布
+        # Build a multivariate normal with diagonal covariance
         # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
         """
-        采用多元正态分布
+        Uses a multivariate normal distribution
         """
         dist = MultivariateNormalDiag(loc=means, scale_diag=std)
 
-        # 裁剪动作以保持与forward函数一致
+        # Clip the actions to stay consistent with forward()
         # epsilon = 1e-6
         # actions = torch.clamp(actions, -1+epsilon, 1-epsilon)
         
         # Compute log_probs
-        # 计算采样动作的对数概率
-        if actions.dim() == 2:  # 单个动作: [batch_size, action_dim]
+        # Compute the log-probability of the sampled actions
+        if actions.dim() == 2:  # single action: [batch_size, action_dim]
             log_probs = dist.log_prob(actions)
-        elif actions.dim() == 3:  # 多个动作: [n, batch_size, action_dim]
-            # 为每个样本计算对数概率
+        elif actions.dim() == 3:  # multiple actions: [n, batch_size, action_dim]
+            # Compute the log-probability of each sample
             n = actions.shape[0]
             log_probs = torch.stack([dist.log_prob(actions[i]) for i in range(n)])
            
             # actions=actions.reshape(-1, actions.shape[-1])
-            # print("调整后actions尺寸: ", actions.shape)
+            # print("actions shape after reshaping: ", actions.shape)
             # log_probs = dist.log_prob(actions) # torch.Size([n*batch_size, action_dim])
             # log_probs = log_probs.reshape(n, -1, log_probs.shape[-1])
         
@@ -610,18 +619,18 @@ class Policy(nn.Module):
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
       
         # Get network outputs
-        # 网络输出与均值计算
+        # Network output and mean
         outputs = self.network(obs_enc)
       
         means = self.mean_layer(outputs)
 
         """
-        means经过tanh放缩
+        means are squashed with tanh
         """
         means = torch.tanh(means)
 
         # Compute standard deviations
-        # 标准差计算    
+        # Standard deviation    
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
             std = torch.exp(log_std)  # Match JAX "exp"
@@ -631,11 +640,11 @@ class Policy(nn.Module):
         
 
         # Build transformed distribution
-        # 构建一个对角线协方差的多元正态分布
+        # Build a multivariate normal with diagonal covariance
         # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
 
         """
-        采用多元正态分布
+        Uses a multivariate normal distribution
         """
 
         dist = MultivariateNormalDiag(loc=means, scale_diag=std)
